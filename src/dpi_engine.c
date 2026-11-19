@@ -518,6 +518,78 @@ static void send_fake_packets(DpiEngine *eng,
     }
 }
 
+static void send_quic_port_unreachable(HANDLE wd,
+                                       const uint8_t *orig_pkt, UINT orig_len,
+                                       PWINDIVERT_IPHDR orig_ip, PWINDIVERT_IPV6HDR orig_ipv6,
+                                       const WINDIVERT_ADDRESS *orig_addr,
+                                       uint8_t *scratch_buf) {
+    /* Injects a local inbound ICMP/ICMPv6 Port Unreachable so browsers/Discord immediately
+     * abort HTTP/3 QUIC (<1 ms) and fall back to TCP/443 instead of stalling for UDP timeout. */
+    if (orig_ip) {
+        size_t orig_ip_len = (size_t)orig_ip->HdrLength * 4;
+        if (orig_ip_len < 20 || orig_ip_len + 8 > orig_len) return;
+        size_t copy_len = orig_ip_len + 8; /* Original IP header + 8-byte UDP header */
+        UINT new_len = (UINT)(20 + 8 + copy_len);
+        if (new_len > JAPONDPI_PACKET_BUF) return;
+
+        memset(scratch_buf, 0, 28);
+        PWINDIVERT_IPHDR ip = (PWINDIVERT_IPHDR)scratch_buf;
+        ip->Version   = 4;
+        ip->HdrLength = 5;
+        ip->Length    = htons((uint16_t)new_len);
+        ip->Id        = htons(0x4A50);
+        ip->TTL       = 64;
+        ip->Protocol  = 1; /* ICMP */
+        ip->SrcAddr   = orig_ip->DstAddr;
+        ip->DstAddr   = orig_ip->SrcAddr;
+
+        PWINDIVERT_ICMPHDR icmp = (PWINDIVERT_ICMPHDR)(scratch_buf + 20);
+        icmp->Type = 3; /* Destination Unreachable */
+        icmp->Code = 3; /* Port Unreachable */
+
+        memcpy(scratch_buf + 28, orig_pkt, copy_len);
+
+        WINDIVERT_ADDRESS raddr = *orig_addr;
+        raddr.Outbound    = 0;
+        raddr.IPChecksum  = 0;
+        raddr.TCPChecksum = 0;
+        raddr.UDPChecksum = 0;
+        g_wd.HelperCalcChecksums(scratch_buf, new_len, &raddr,
+            WINDIVERT_HELPER_NO_TCP_CHECKSUM | WINDIVERT_HELPER_NO_UDP_CHECKSUM |
+            WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM);
+        g_wd.Send(wd, scratch_buf, new_len, NULL, &raddr);
+    } else if (orig_ipv6) {
+        if (orig_len < 48) return;
+        size_t copy_len = 48; /* 40-byte IPv6 header + 8-byte UDP header */
+        UINT new_len = (UINT)(40 + 8 + copy_len);
+
+        memset(scratch_buf, 0, 48);
+        PWINDIVERT_IPV6HDR ip6 = (PWINDIVERT_IPV6HDR)scratch_buf;
+        ip6->Version  = 6;
+        ip6->Length   = htons((uint16_t)(8 + copy_len));
+        ip6->NextHdr  = 58; /* ICMPv6 */
+        ip6->HopLimit = 64;
+        memcpy(ip6->SrcAddr, orig_ipv6->DstAddr, 16);
+        memcpy(ip6->DstAddr, orig_ipv6->SrcAddr, 16);
+
+        PWINDIVERT_ICMPV6HDR icmp6 = (PWINDIVERT_ICMPV6HDR)(scratch_buf + 40);
+        icmp6->Type = 1; /* Destination Unreachable */
+        icmp6->Code = 4; /* Port Unreachable */
+
+        memcpy(scratch_buf + 48, orig_pkt, copy_len);
+
+        WINDIVERT_ADDRESS raddr = *orig_addr;
+        raddr.Outbound    = 0;
+        raddr.IPChecksum  = 0;
+        raddr.TCPChecksum = 0;
+        raddr.UDPChecksum = 0;
+        g_wd.HelperCalcChecksums(scratch_buf, new_len, &raddr,
+            WINDIVERT_HELPER_NO_IP_CHECKSUM | WINDIVERT_HELPER_NO_TCP_CHECKSUM |
+            WINDIVERT_HELPER_NO_UDP_CHECKSUM | WINDIVERT_HELPER_NO_ICMP_CHECKSUM);
+        g_wd.Send(wd, scratch_buf, new_len, NULL, &raddr);
+    }
+}
+
 static bool handle_inbound_passive_dpi(DpiEngine *eng,
                                        PWINDIVERT_IPHDR ip_hdr, PWINDIVERT_IPV6HDR ipv6_hdr,
                                        PWINDIVERT_TCPHDR tcp_hdr,
@@ -750,8 +822,9 @@ int dpi_engine_run(DpiEngine *eng) {
             if (outbound && eng->cfg.block_quic && udp_hdr->DstPort == htons(443)) {
                 if (dpi_is_quic_initial(payload, data_len)) {
                     InterlockedIncrement64(&eng->stats.quic_blocked);
+                    send_quic_port_unreachable(wd, pkt_buf, pkt_len, ip_hdr, ipv6_hdr, &addr, scratch_buf);
                     if (eng->cfg.verbose) {
-                        printf("[QUIC] UDP:443 QUIC Initial engellendi -> TCP/443 fallback\n");
+                        printf("[QUIC] UDP:443 QUIC Initial engellendi -> aninda TCP/443 fallback\n");
                     }
                     continue; /* drop QUIC Initial */
                 }

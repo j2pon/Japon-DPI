@@ -12,9 +12,10 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [PROFIL] Turknet / Ozel DNS (Auto-TTL + SNI Bolme + QUIC, DNS degistirilmez)
+echo [PROFIL] Turknet / Ozel DNS (Auto-TTL + SNI Bolme + QUIC + Port 2053, DNS degistirilmez)
+ipconfig /flushdns >nul 2>&1
 echo.
-"%~dp0x86_64\japondpi.exe" --auto-ttl --set-ttl 5 --split-sni -e 2 -f 2 -r -m -p --block-quic
+"%~dp0x86_64\japondpi.exe" --auto-ttl --set-ttl 5 --split-sni -e 2 -f 2 -r -m -p --port 2053 --block-quic
 echo.
 pause
 popd

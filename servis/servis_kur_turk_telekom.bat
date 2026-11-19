@@ -28,9 +28,10 @@ timeout /t 1 /nobreak >nul
 sc delete "JaponDPI" >nul 2>&1
 
 echo Japon DPI servisi (Turk Telekom) kuruluyor...
-sc create "JaponDPI" binPath= "\"%EXE%\" --service --set-ttl 5 --split-sni -e 2 -f 2 -r -m -p --dns-addr 77.88.8.8 --dns-port 1253 --dnsv6-addr 2a02:6b8::feed:0ff --dnsv6-port 1253 --block-quic" start= "auto" DisplayName= "Japon DPI"
+sc create "JaponDPI" binPath= "\"%EXE%\" --service --auto-ttl --set-ttl 5 --split-sni --reverse-frag -e 2 -f 2 -r -m -p --port 2053 --dns-addr 77.88.8.8 --dns-port 1253 --dnsv6-addr 2a02:6b8::feed:0ff --dnsv6-port 1253 --block-quic" start= "auto" DisplayName= "Japon DPI"
 sc description "JaponDPI" "Japon DPI - Turk Telekom Profili (WinDivert 2.2)"
 sc start "JaponDPI"
+ipconfig /flushdns >nul 2>&1
 echo.
 echo [TAMAM] Servis kuruldu ve baslatildi. Bilgisayar acilinca otomatik calisacaktir.
 pause

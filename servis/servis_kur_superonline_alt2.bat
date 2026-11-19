@@ -28,9 +28,10 @@ timeout /t 1 /nobreak >nul
 sc delete "JaponDPI" >nul 2>&1
 
 echo Japon DPI servisi (Superonline Alternatif 2) kuruluyor...
-sc create "JaponDPI" binPath= "\"%EXE%\" --service --wrong-seq --fake-repeats 2 --multi-split --reverse-frag -e 2 -f 2 -r -p --dns-addr 77.88.8.8 --dns-port 1253 --block-dnsv6 --block-quic" start= "auto" DisplayName= "Japon DPI"
+sc create "JaponDPI" binPath= "\"%EXE%\" --service --wrong-seq --fake-repeats 2 --multi-split --reverse-frag -e 2 -f 2 -r -p --port 2053 --dns-addr 77.88.8.8 --dns-port 1253 --block-dnsv6 --block-quic" start= "auto" DisplayName= "Japon DPI"
 sc description "JaponDPI" "Japon DPI - Superonline Profili 2 (WinDivert 2.2)"
 sc start "JaponDPI"
+ipconfig /flushdns >nul 2>&1
 echo.
 echo [TAMAM] Servis kuruldu ve baslatildi. Bilgisayar acilinca otomatik calisacaktir.
 pause
