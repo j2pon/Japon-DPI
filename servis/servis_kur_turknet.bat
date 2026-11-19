@@ -29,7 +29,7 @@ sc delete "JaponDPI" >nul 2>&1
 
 echo Japon DPI servisi (Turknet) kuruluyor...
 set "WL=%ROOT%\whitelist.txt"
-sc create "JaponDPI" binPath= "\"%EXE%\" --service --auto-ttl --set-ttl 5 --wrong-seq --split-sni -e 2 -f 2 -r -m -p --port 2053 --block-quic --whitelist \"%WL%\"" start= "auto" DisplayName= "Japon DPI"
+sc create "JaponDPI" binPath= "\"%EXE%\" --service --auto-ttl --set-ttl 5 --split-sni -e 2 -f 2 -r -m -p --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --block-quic --whitelist \"%WL%\"" start= "auto" DisplayName= "Japon DPI"
 sc description "JaponDPI" "Japon DPI - Turknet Profili (WinDivert 2.2)"
 sc start "JaponDPI"
 ipconfig /flushdns >nul 2>&1

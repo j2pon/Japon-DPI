@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
 echo [PROFIL] Turknet / Ozel DNS (Auto-TTL + SNI Bolme + QUIC + Port 2053, DNS degistirilmez)
 ipconfig /flushdns >nul 2>&1
 echo.
-"%~dp0x86_64\japondpi.exe" --auto-ttl --set-ttl 5 --wrong-seq --split-sni -e 2 -f 2 -r -m -p --port 2053 --block-quic --whitelist "%~dp0whitelist.txt"
+"%~dp0x86_64\japondpi.exe" --auto-ttl --set-ttl 5 --split-sni -e 2 -f 2 -r -m -p --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --block-quic --whitelist "%~dp0whitelist.txt"
 echo.
 pause
 popd
