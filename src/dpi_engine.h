@@ -1,0 +1,49 @@
+#ifndef JAPONDPI_DPI_ENGINE_H
+#define JAPONDPI_DPI_ENGINE_H
+
+#include "config.h"
+#include "wd_loader.h"
+#include "fake_payloads.h"
+#include "ttl_cache.h"
+#include "dns_redir.h"
+#include "domain_list.h"
+
+typedef struct {
+    JaponConfig   cfg;
+    JaponStats    stats;
+    FakePayloads  fakes;
+    TtlCache      ttl_cache;
+    DnsRedirector dns_redir;
+    DomainList    blacklist;
+    DomainList    whitelist;
+    bool          has_blacklist;
+    bool          has_whitelist;
+    HANDLE        wd_handle;
+    volatile LONG stop_flag;
+} DpiEngine;
+
+typedef struct {
+    bool   found_sni;
+    size_t sni_offset;
+    size_t sni_len;
+    char   sni_host[JAPONDPI_MAX_HOST];
+} TlsParseResult;
+
+/* Lifecycle */
+bool dpi_engine_init(DpiEngine *eng, const JaponConfig *cfg, char *err_buf, size_t err_len);
+void dpi_engine_destroy(DpiEngine *eng);
+void dpi_engine_request_stop(DpiEngine *eng);
+
+/* Builds optimized WinDivert kernel filter string based on active options */
+bool dpi_build_filter(const JaponConfig *cfg, char *buf, size_t buf_len);
+
+/* Main WinDivert packet processing loop (blocking until stopped) */
+int  dpi_engine_run(DpiEngine *eng);
+
+/* Pure helper functions (also unit-tested via --self-test) */
+bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResult *out);
+bool dpi_extract_http_host(const uint8_t *payload, size_t len, char *host_out, size_t host_cap);
+bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cfg);
+bool dpi_is_quic_initial(const uint8_t *payload, size_t len);
+
+#endif /* JAPONDPI_DPI_ENGINE_H */
