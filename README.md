@@ -1,15 +1,15 @@
-# Japon DPI v1.0.0
+# Japon DPI v1.1.0
 
-**Japon DPI**, GoodbyeDPI prensibiyle çalışan, **%100 açık kaynaklı, saf C (x64)** ile yazılmış, sıfır paketleyici (UPX/PyInstaller yok) içeren, ultra hafif (~84 KB) ve yüksek performanslı bir WinDivert 2.2 DPI aşma aracıdır.
+**Japon DPI**, resmi GoodbyeDPI prensibiyle birebir uyumlu çalışan; **%100 açık kaynaklı, saf C11 (x64)** ile yazılmış, sıfır paketleyici (UPX/PyInstaller yok) içeren, ultra hafif (~126 KB) ve yüksek performanslı bir WinDivert 2.2 DPI aşma aracıdır.
 
 ---
 
 ## Neden Hızlı ve Stabil?
 
-- **Çekirdek Düzeyinde Akıllı Filtreleme:** WinDivert filtresi yalnızca TLS `ClientHello` el sıkışma paketlerini (`0x16 0x03 ... 0x01`), HTTP başlık isteklerini ve (açıksa) UDP:53 DNS sorgularını yakalar. Video akışları, dosya indirmeleri, Discord ses paketleri ve oyun trafiği kullanıcı moduna hiç taşınmaz — **0 ms ping artışı, 0 hız kaybı**.
-- **Modern Tarayıcı / Post-Quantum (ML-KEM768) Uyumlu:** Chrome, Brave, Edge ve Firefox'un 1400+ baytlık yeni nesil TLS ClientHello paketlerini eksiksiz yakalar ve LSO/TSO güvenli parçalama yapar.
-- **Sıfır Bellek Sızıntısı:** Paket döngüsünde tek bir `malloc`/`free` çağrısı bile yapılmaz; sabit boyutlu O(1) hash tabloları ile günlerce stabil çalışır.
-- **Şeffaf ve Denetlenebilir:** Tüm kaynak kod `src\` klasöründedir; `build.bat` ile istediğiniz zaman kendiniz yeniden derleyebilirsiniz.
+- **Birebir GoodbyeDPI Çalışma Prensibi:** `-5 --set-ttl 5` modunda gelen hiçbir TCP paketi (SYN-ACK/RST/veri) kullanıcı moduna alınmaz; yerel ağ (`192.168/16`, `10/8`, `172.16/12`, `127/8`) çekirdekte hariç tutulur ve QUIC/HTTP3 açık bırakılarak sitelerin 0-RTT hızında açılması sağlanır.
+- **Ters Parçalama + `PSH=1` Koruması:** `[2..son)` parçası önce, `[0..2)` parçası sonra gönderilir; hedef sunucu parçaları tek bir bütün `ClientHello` olarak birleştirip uygulamayı tek seferde uyandırır (sıfır ekstra gecikme).
+- **Modern Tarayıcı (ML-KEM768) & Whitelist Desteği:** 1400+ baytlık Post-Quantum `ClientHello` paketlerini eksiksiz yakalar, [whitelist.txt](whitelist.txt) ile YouTube/Google/Steam/oyun trafiğine hiç dokunmaz.
+- **Sıfır Bellek Sızıntısı:** Paket döngüsünde `malloc`/`free` çağrısı yapılmaz; sabit boyutlu O(1) hash tabloları ile günlerce stabil çalışır.
 
 ---
 
@@ -29,13 +29,14 @@ Aşağıdaki `.bat` dosyalarından kendi internet sağlayıcınıza uygun olana 
 
 | Dosya | Sağlayıcı / Kullanım | Uygulanan Yöntem |
 |---|---|---|
-| `1_turk_telekom.bat` | **Türk Telekom / TTNET** | TTL=5 Sahte Paket + SNI Ortası Bölme + IPv4/IPv6 DNS (`77.88.8.8:1253`) + QUIC |
-| `2_superonline_alternatif1.bat` | **Turkcell Superonline (Önerilen)** | TTL=3 + 2x Sahte Paket + Ters Sıralı SNI Bölme + DNS (`77.88.8.8:1253`) + IPv6 DNS Engeli |
-| `3_superonline_alternatif2.bat` | **Turkcell Superonline (Alt. 2)** | Wrong-Seq + 2x Sahte Paket + 3-Parçalı Ters Bölme + DNS (Bölgesel hop farkları için) |
-| `4_superonline_alternatif3.bat` | **Turkcell Superonline (Alt. 3)** | TTL=5 + Wrong-Seq + 3-Parçalı Ters Bölme + DNS (Fiber/Farklı BRAS için) |
-| `5_kablonet_vodafone.bat` | **Türksat Kablonet & Vodafone Net** | Auto-TTL (Otomatik Hop Ölçümü) + Ters SNI Bölme + IPv4/IPv6 DNS + QUIC |
-| `6_turknet_dns_yok.bat` | **Türknet / Özel DoH DNS** | Auto-TTL + SNI Bölme + QUIC (Sistem DNS ayarınıza dokunmaz) |
-| `7_genel_evrensel.bat` | **Tüm ISS'ler (Evrensel)** | `-5` + Bozuk Checksum + Wrong-Seq + DNS Yönlendirme + QUIC |
+| `1_turk_telekom.bat` | **Türk Telekom / TTNET** | `-5 --set-ttl 5` + Hızlı OpenDNS (`208.67.222.222:443`) + HTTP/3 Açık + Discord Portları + `whitelist.txt` |
+| `2_superonline_alternatif1.bat` | **Turkcell Superonline (Önerilen)** | `-5 --set-ttl 3` + Yandex DNS (`77.88.8.8:1253`, IPv4+IPv6) + `whitelist.txt` |
+| `3_superonline_alternatif2.bat` | **Turkcell Superonline (Alt. 2)** | `-5` (Auto-TTL) + Yandex DNS (`77.88.8.8:1253`) + `whitelist.txt` |
+| `4_superonline_alternatif3.bat` | **Turkcell Superonline (Alt. 3)** | `-9` (Ayrı Wrong-Chksum + Wrong-Seq + Seçici QUIC) + Yandex DNS + `whitelist.txt` |
+| `5_kablonet_vodafone.bat` | **Türksat Kablonet & Vodafone Net** | `-5 --set-ttl 5` + Hızlı OpenDNS (`208.67.222.222:443`) + `whitelist.txt` |
+| `6_turknet_dns_yok.bat` | **Türknet / Özel DoH DNS** | `-5 --set-ttl 5` (DNS'e dokunmaz) + `whitelist.txt` |
+| `7_genel_evrensel.bat` | **Tüm ISS'ler (Evrensel)** | `-9` + Hızlı OpenDNS (`208.67.222.222:443`) + `whitelist.txt` |
+| `servis_kaldir.bat` | **Tam Kaldırma** | Çalışan `japondpi.exe`, `JaponDPI` servisi ve `WinDivert` sürücüsünü temizler |
 
 > **İpucu:** İlk denemede hangi `.bat` profilinin sorunsuz açtığını test edin. Siyah pencere açık kaldığı sürece Japon DPI aktif kalır; `Ctrl+C` ile güvenle durdurabilirsiniz.
 

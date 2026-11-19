@@ -1,8 +1,33 @@
 #include "dns_redir.h"
-#include <winsock2.h>
 #include <string.h>
 
 #define DNS_NAT_EXPIRE_MS 30000ULL /* 30 seconds */
+
+bool dns_flush_system_cache(void) {
+    typedef BOOL (WINAPI *pfn_DnsFlushResolverCache)(void);
+    HMODULE hDns = LoadLibraryA("dnsapi.dll");
+    if (!hDns) return false;
+    pfn_DnsFlushResolverCache fn = (pfn_DnsFlushResolverCache)(void *)GetProcAddress(hDns, "DnsFlushResolverCache");
+    bool ok = (fn != NULL && fn() != 0);
+    FreeLibrary(hDns);
+    return ok;
+}
+
+bool dns_is_valid_packet(const uint8_t *payload, UINT payload_len, bool outbound) {
+    if (!payload || payload_len < 16) return false;
+    uint16_t flags = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
+    uint16_t qdcount = (uint16_t)(((uint16_t)payload[4] << 8) | payload[5]);
+    if (qdcount == 0) return false;
+    if (outbound) {
+        /* Standard DNS query: QR=0, Opcode=0, TC=0, Z=0, ANCOUNT=0, NSCOUNT=0 */
+        uint16_t ancount = (uint16_t)(((uint16_t)payload[6] << 8) | payload[7]);
+        uint16_t nscount = (uint16_t)(((uint16_t)payload[8] << 8) | payload[9]);
+        return ((flags & 0xFA00) == 0) && ancount == 0 && nscount == 0;
+    } else {
+        /* Standard DNS response: QR=1, Opcode=0 */
+        return ((flags & 0xF800) == 0x8000);
+    }
+}
 
 static uint32_t dns_slot_hash(bool is_v6, const uint32_t client_ip[4],
                               uint16_t client_port_net, uint16_t txid) {
@@ -33,8 +58,7 @@ static bool is_ipv4_loopback_or_mcast(uint32_t ip_net) {
 
 static bool is_ipv6_loopback_or_mcast(const uint32_t ip_net[4]) {
     const uint8_t *b = (const uint8_t *)ip_net;
-    if (b[0] == 0xFF) return true; /* multicast */
-    /* ::1 loopback */
+    if (b[0] == 0xFF) return true;
     for (int i = 0; i < 15; i++) {
         if (b[i] != 0) return false;
     }
@@ -53,9 +77,11 @@ int dns_redir_process(DnsRedirector *dr, const JaponConfig *cfg, JaponStats *sta
     if (!udp_hdr) return 0;
 
     bool is_v6 = (ipv6_hdr != NULL);
-    uint16_t txid = (payload && payload_len >= 2)
-                  ? (uint16_t)(((uint16_t)payload[0] << 8) | payload[1])
-                  : 0;
+    if (!dns_is_valid_packet(payload, payload_len, outbound)) {
+        return 0;
+    }
+
+    uint16_t txid = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
     uint64_t now = GetTickCount64();
 
     if (outbound) {
@@ -96,7 +122,7 @@ int dns_redir_process(DnsRedirector *dr, const JaponConfig *cfg, JaponStats *sta
         } else {
             if (!cfg->dns_redir_v6) {
                 if (cfg->block_dns_v6) {
-                    return -1; /* drop outbound IPv6 DNS so Windows falls back to IPv4 */
+                    return -1;
                 }
                 return 0;
             }
@@ -134,7 +160,6 @@ int dns_redir_process(DnsRedirector *dr, const JaponConfig *cfg, JaponStats *sta
             return 1;
         }
     } else {
-        /* Inbound DNS response from configured target server */
         if (!is_v6) {
             if (!cfg->dns_redir_v4 || !ip_hdr) return 0;
             if (ip_hdr->SrcAddr != cfg->dns_addr_v4_net ||

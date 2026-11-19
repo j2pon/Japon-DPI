@@ -1,10 +1,47 @@
 #include "dpi_engine.h"
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+/* GoodbyeDPI-style private/local network exclusions (zero LAN/router interference) */
+#define NO_LOCALNETS_V4_DST \
+    "((ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255) and " \
+    "(ip.DstAddr < 10.0.0.0 or ip.DstAddr > 10.255.255.255) and " \
+    "(ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255) and " \
+    "(ip.DstAddr < 172.16.0.0 or ip.DstAddr > 172.31.255.255) and " \
+    "(ip.DstAddr < 169.254.0.0 or ip.DstAddr > 169.254.255.255))"
+
+#define NO_LOCALNETS_V4_SRC \
+    "((ip.SrcAddr < 127.0.0.1 or ip.SrcAddr > 127.255.255.255) and " \
+    "(ip.SrcAddr < 10.0.0.0 or ip.SrcAddr > 10.255.255.255) and " \
+    "(ip.SrcAddr < 192.168.0.0 or ip.SrcAddr > 192.168.255.255) and " \
+    "(ip.SrcAddr < 172.16.0.0 or ip.SrcAddr > 172.31.255.255) and " \
+    "(ip.SrcAddr < 169.254.0.0 or ip.SrcAddr > 169.254.255.255))"
+
+#define NO_LOCALNETS_V6_DST \
+    "((ipv6.DstAddr > ::1) and " \
+    "(ipv6.DstAddr < fc00::0 or ipv6.DstAddr > fe00::0) and " \
+    "(ipv6.DstAddr < fe80::0 or ipv6.DstAddr > fec0::0) and " \
+    "(ipv6.DstAddr < ff00::0 or ipv6.DstAddr > ffff::0))"
+
+#define NO_LOCALNETS_V6_SRC \
+    "((ipv6.SrcAddr > ::1) and " \
+    "(ipv6.SrcAddr < fc00::0 or ipv6.SrcAddr > fe00::0) and " \
+    "(ipv6.SrcAddr < fe80::0 or ipv6.SrcAddr > fec0::0) and " \
+    "(ipv6.SrcAddr < ff00::0 or ipv6.SrcAddr > ffff::0))"
+
+/* Kernel-only DROP filters (exact GoodbyeDPI zero-usermode architecture) */
+#define FILTER_KERNEL_DROP_QUIC \
+    "outbound and !impostor and !loopback and udp and udp.DstPort == 443 and " \
+    "udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0 and " \
+    "(udp.Payload32[1b] == 0x01 or udp.Payload32[1b] == 0x6b3343cf)"
+
+#define FILTER_KERNEL_DROP_PASSIVE_RST \
+    "inbound and ip and tcp and !impostor and !loopback and " \
+    "(ip.Id >= 0x0 and ip.Id <= 0xF) and " \
+    "(tcp.SrcPort == 443 or tcp.SrcPort == 80) and tcp.Rst and " \
+    NO_LOCALNETS_V4_SRC
 
 /* ============================================================================
  * Pure Packet Parsers & Helpers
@@ -14,7 +51,7 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
     memset(out, 0, sizeof(*out));
     if (!payload || len < 43) return false;
 
-    /* TLS Record Header: 0x16 (Handshake), 0x03 0x00..0x04 */
+    /* TLS Record Header: 0x16 (Handshake), 0x03 0x00..0x03 */
     if (payload[0] != 0x16 || payload[1] != 0x03 || payload[2] > 0x04) {
         return false;
     }
@@ -23,8 +60,8 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
         return false;
     }
 
-    size_t pos = 9; /* skip 5-byte record hdr + 4-byte handshake hdr */
-    if (pos + 2 + 32 + 1 > len) return true; /* valid ClientHello, truncated before SNI */
+    size_t pos = 9;
+    if (pos + 2 + 32 + 1 > len) return true;
 
     pos += 2;  /* client_version */
     pos += 32; /* random */
@@ -50,7 +87,7 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
     pos += 2;
 
     size_t ext_end = pos + ext_total;
-    if (ext_end > len) ext_end = len; /* handle multi-segment ML-KEM ClientHello cleanly */
+    if (ext_end > len) ext_end = len;
 
     while (pos + 4 <= ext_end) {
         uint16_t ext_type = (uint16_t)(((uint16_t)payload[pos] << 8) | payload[pos + 1]);
@@ -59,7 +96,6 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
         if (pos + ext_len > ext_end) break;
 
         if (ext_type == 0x0000 && ext_len >= 5) {
-            /* server_name extension */
             size_t sni_pos = pos;
             uint16_t list_len = (uint16_t)(((uint16_t)payload[sni_pos] << 8) | payload[sni_pos + 1]);
             sni_pos += 2;
@@ -89,7 +125,7 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
         pos += ext_len;
     }
 
-    return true; /* Valid TLS ClientHello even if SNI is in a subsequent TCP segment */
+    return true;
 }
 
 static int find_http_method_space(const uint8_t *payload, size_t len) {
@@ -99,7 +135,7 @@ static int find_http_method_space(const uint8_t *payload, size_t len) {
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
         size_t mlen = strlen(methods[i]);
         if (len > mlen && memcmp(payload, methods[i], mlen) == 0) {
-            return (int)(mlen - 1); /* index of space right after method */
+            return (int)(mlen - 1);
         }
     }
     return -1;
@@ -113,7 +149,7 @@ static bool find_http_host_header(const uint8_t *payload, size_t len,
     for (size_t i = 0; i + 7 < len; i++) {
         if (payload[i] == '\r' && payload[i + 1] == '\n') {
             if (i + 3 < len && payload[i + 2] == '\r' && payload[i + 3] == '\n') {
-                break; /* end of HTTP headers */
+                break;
             }
             size_t h = i + 2;
             if (h + 5 <= len &&
@@ -150,7 +186,7 @@ bool dpi_extract_http_host(const uint8_t *payload, size_t len, char *host_out, s
     size_t n = 0;
     for (size_t i = 0; i < val_len && n + 1 < host_cap; i++) {
         unsigned char c = payload[val_pos + i];
-        if (c == ':' || c == ' ' || c == '\t') break; /* strip :port */
+        if (c == ':' || c == ' ' || c == '\t') break;
         host_out[n++] = (char)tolower(c);
     }
     host_out[n] = '\0';
@@ -167,7 +203,6 @@ bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cf
 
     bool modified = false;
 
-    /* 1. Replace "Host:" with "hoSt:" (length invariant: 5 -> 5) */
     if (cfg->http_host_replace) {
         payload[hdr_pos + 0] = 'h';
         payload[hdr_pos + 1] = 'o';
@@ -176,7 +211,6 @@ bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cf
         modified = true;
     }
 
-    /* 2. Mix case of hostname (length invariant) */
     if (cfg->http_host_mixcase) {
         for (size_t i = 0; i < val_len; i++) {
             unsigned char c = payload[val_pos + i];
@@ -188,8 +222,6 @@ bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cf
         modified = true;
     }
 
-    /* 3. Remove space after "Host:" and balance by adding space after HTTP method
-     *    Total payload length remains 100% identical (zero TCP sequence desync!) */
     if (cfg->http_host_rmspace) {
         size_t host_sp = hdr_pos + 5;
         if (host_sp < len && payload[host_sp] == ' ' && (size_t)method_sp < host_sp) {
@@ -203,8 +235,6 @@ bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cf
 }
 
 bool dpi_is_quic_initial(const uint8_t *payload, size_t len) {
-    /* RFC 9000: QUIC Initial datagrams MUST be at least 1200 bytes and have Long Header bit (0x80)
-     * plus Fixed Bit (0x40), packet type Initial = 00 (for v1) or 01 (for v2). */
     if (!payload || len < 1200) return false;
     if ((payload[0] & 0xC0) != 0xC0) return false;
 
@@ -213,23 +243,14 @@ bool dpi_is_quic_initial(const uint8_t *payload, size_t len) {
                    ((uint32_t)payload[3] << 8)  |
                    ((uint32_t)payload[4]);
 
-    /* QUIC v1 (0x00000001), QUIC v2 (0x6b3343cf), IETF drafts (0xff0000xx) */
-    if (ver == 0x00000001U) {
-        /* v1 Initial: bits 5..4 == 00 */
-        return ((payload[0] & 0x30) == 0x00);
-    }
-    if (ver == 0x6b3343cfU) {
-        /* v2 Initial: bits 5..4 == 01 */
-        return ((payload[0] & 0x30) == 0x10);
-    }
-    if ((ver & 0xFFFFFF00U) == 0xFF000000U) {
-        return ((payload[0] & 0x30) == 0x00);
-    }
+    if (ver == 0x00000001U) return ((payload[0] & 0x30) == 0x00);
+    if (ver == 0x6b3343cfU) return ((payload[0] & 0x30) == 0x10);
+    if ((ver & 0xFFFFFF00U) == 0xFF000000U) return ((payload[0] & 0x30) == 0x00);
     return false;
 }
 
 /* ============================================================================
- * Whitelisted IP Cache (for 0-RTT QUIC pass-through on YouTube/Google/Games)
+ * Whitelisted IP Cache (for 0-RTT QUIC pass-through when -q + --whitelist used)
  * ========================================================================== */
 
 #define IP_WL_EXPIRE_MS 600000ULL /* 10 minutes */
@@ -289,14 +310,12 @@ bool dpi_ip_wl_contains(const IpWhitelistCache *cache, bool is_v6, const uint32_
 void dpi_dns_learn_whitelist_ips(const uint8_t *dns, size_t len,
                                  const DomainList *whitelist, IpWhitelistCache *ip_wl) {
     if (!dns || len < 17 || !whitelist || !ip_wl) return;
-    /* Must be a DNS response (QR bit = 1) with no error (RCODE = 0) */
     if ((dns[2] & 0x80) == 0 || (dns[3] & 0x0F) != 0) return;
 
     uint16_t qdcount = (uint16_t)(((uint16_t)dns[4] << 8) | dns[5]);
     uint16_t ancount = (uint16_t)(((uint16_t)dns[6] << 8) | dns[7]);
     if (qdcount == 0 || ancount == 0) return;
 
-    /* Extract QNAME from Question #1 */
     char qname[JAPONDPI_MAX_HOST];
     size_t qlen = 0;
     size_t pos = 12;
@@ -316,9 +335,8 @@ void dpi_dns_learn_whitelist_ips(const uint8_t *dns, size_t len,
     }
     qname[qlen] = '\0';
     if (qlen == 0 || pos + 4 > len) return;
-    pos += 4; /* skip QTYPE + QCLASS */
+    pos += 4;
 
-    /* Skip additional questions if any */
     for (uint16_t q = 1; q < qdcount; q++) {
         while (pos < len) {
             uint8_t b = dns[pos++];
@@ -334,10 +352,8 @@ void dpi_dns_learn_whitelist_ips(const uint8_t *dns, size_t len,
         return;
     }
 
-    /* Record all A (IPv4) and AAAA (IPv6) answer IPs into IP whitelist cache */
     uint16_t limit = ancount > 32 ? 32 : ancount;
     for (uint16_t a = 0; a < limit && pos < len; a++) {
-        /* Skip answer NAME */
         while (pos < len) {
             uint8_t b = dns[pos];
             if (b == 0) { pos++; break; }
@@ -364,7 +380,7 @@ void dpi_dns_learn_whitelist_ips(const uint8_t *dns, size_t len,
 }
 
 /* ============================================================================
- * WinDivert Kernel Filter Builder
+ * WinDivert Kernel Filter Builder (GoodbyeDPI-grade zero-overhead filter)
  * ========================================================================== */
 
 static bool append_str(char *buf, size_t buf_len, size_t *pos, const char *s) {
@@ -382,12 +398,10 @@ bool dpi_build_filter(const JaponConfig *cfg, char *buf, size_t buf_len) {
 
     if (!append_str(buf, buf_len, &pos, "!impostor and !loopback and (")) return false;
 
-    bool need_or = false;
-    char tmp[512];
+    char tmp[1024];
 
-    /* 1. Outbound TLS ClientHello (port 443 + extra ports)
-     *    Kernel-level signature check (0x16 0x03 ... 0x01) means 100% of bulk HTTPS data
-     *    never leaves the kernel! Supports post-quantum ML-KEM768 ClientHellos (>1400B). */
+    /* 1. Outbound TLS ClientHello (port 443 + extra ports), EXCLUDING local/private networks!
+     *    Kernel-level 0x16 0x03 .. 0x01 check means 100% of bulk HTTPS traffic stays in kernel! */
     char tls_ports[256];
     size_t tp = 0;
     tls_ports[0] = '\0';
@@ -400,27 +414,33 @@ bool dpi_build_filter(const JaponConfig *cfg, char *buf, size_t buf_len) {
 
     if (cfg->max_payload > 0) {
         snprintf(tmp, sizeof(tmp),
-            "(outbound and tcp and (%s) and tcp.PayloadLength >= 6 and tcp.PayloadLength <= %u "
-            "and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01)",
+            "(outbound and tcp and tcp.Ack and (%s) and "
+            "tcp.PayloadLength >= 6 and tcp.PayloadLength <= %u and "
+            "tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[2] <= 0x03 and tcp.Payload[5] == 0x01 and "
+            "(" NO_LOCALNETS_V4_DST " or " NO_LOCALNETS_V6_DST "))",
             tls_ports, (unsigned)cfg->max_payload);
     } else {
         snprintf(tmp, sizeof(tmp),
-            "(outbound and tcp and (%s) and tcp.PayloadLength >= 6 "
-            "and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01)",
+            "(outbound and tcp and tcp.Ack and (%s) and "
+            "tcp.PayloadLength >= 6 and "
+            "tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[2] <= 0x03 and tcp.Payload[5] == 0x01 and "
+            "(" NO_LOCALNETS_V4_DST " or " NO_LOCALNETS_V6_DST "))",
             tls_ports);
     }
     if (!append_str(buf, buf_len, &pos, tmp)) return false;
-    need_or = true;
 
-    /* 2. Outbound HTTP requests (port 80) */
+    /* 2. Outbound HTTP requests (port 80), excluding local/private networks */
     uint16_t http_max = (cfg->max_payload > 0) ? cfg->max_payload : 1500;
     snprintf(tmp, sizeof(tmp),
-        " or (outbound and tcp and tcp.DstPort == 80 and tcp.PayloadLength >= 16 and tcp.PayloadLength <= %u)",
+        " or (outbound and tcp and tcp.Ack and tcp.DstPort == 80 and "
+        "tcp.PayloadLength >= 16 and tcp.PayloadLength <= %u and "
+        "(" NO_LOCALNETS_V4_DST " or " NO_LOCALNETS_V6_DST "))",
         (unsigned)http_max);
     if (!append_str(buf, buf_len, &pos, tmp)) return false;
 
-    /* 3. Inbound SYN-ACK (only when auto-ttl, passive-block, or window-size is active) */
-    if (cfg->auto_ttl || cfg->passive_block || cfg->window_size > 0) {
+    /* 3. Inbound SYN-ACK ONLY when auto-ttl, min-ttl, or window-size requires it!
+     *    With --set-ttl 5 (no auto-ttl, no min-ttl), ZERO inbound TCP packets enter user-mode! */
+    if (cfg->auto_ttl || cfg->min_ttl > 0 || cfg->window_size > 0) {
         char src_ports[256];
         size_t sp = 0;
         src_ports[0] = '\0';
@@ -431,21 +451,23 @@ bool dpi_build_filter(const JaponConfig *cfg, char *buf, size_t buf_len) {
             append_str(src_ports, sizeof(src_ports), &sp, pbuf);
         }
         snprintf(tmp, sizeof(tmp),
-            " or (inbound and tcp and tcp.Syn and tcp.Ack and (%s))", src_ports);
+            " or (inbound and tcp and tcp.Syn and tcp.Ack and (%s) and "
+            "(" NO_LOCALNETS_V4_SRC " or " NO_LOCALNETS_V6_SRC "))",
+            src_ports);
         if (!append_str(buf, buf_len, &pos, tmp)) return false;
     }
 
-    /* 4. Inbound Passive DPI RST / HTTP 302 redirect (only if -p / --passive-block) */
+    /* 4. Inbound Passive DPI HTTP 302 redirect (only if -p; RSTs are kernel-dropped separately!) */
     if (cfg->passive_block) {
         snprintf(tmp, sizeof(tmp),
-            " or (inbound and tcp and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and "
-            "((tcp.Rst and tcp.PayloadLength == 0) or "
-            "(tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 "
-            "and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50)))");
+            " or (inbound and tcp and tcp.SrcPort == 80 and tcp.Ack and "
+            "(ipv6 or (ip.Id >= 0x0 and ip.Id <= 0xF)) and "
+            "tcp.PayloadLength >= 16 and tcp.Payload32[0] == 0x48545450 and "
+            "(" NO_LOCALNETS_V4_SRC " or " NO_LOCALNETS_V6_SRC "))");
         if (!append_str(buf, buf_len, &pos, tmp)) return false;
     }
 
-    /* 5. DNS Redirection IPv4 */
+    /* 5. DNS Redirection IPv4 (NOTE: intentionally allows LAN DNS routers like 192.168.1.1:53!) */
     if (cfg->dns_redir_v4) {
         snprintf(tmp, sizeof(tmp),
             " or (outbound and ip and udp and udp.DstPort == 53)"
@@ -467,21 +489,21 @@ bool dpi_build_filter(const JaponConfig *cfg, char *buf, size_t buf_len) {
         }
     }
 
-    /* 7. QUIC Initial blocking (UDP 443 >= 1200 bytes) */
-    if (cfg->block_quic) {
+    /* 7. Selective QUIC blocking in main handle ONLY when -q AND --whitelist are both active
+     *    (Without --whitelist, -q uses a dedicated kernel-only WINDIVERT_FLAG_DROP handle!) */
+    if (cfg->block_quic && cfg->whitelist_path[0] != '\0') {
         if (!append_str(buf, buf_len, &pos,
-            " or (outbound and udp and udp.DstPort == 443 and udp.PayloadLength >= 1200)")) {
+            " or (outbound and udp and udp.DstPort == 443 and udp.PayloadLength >= 1200 and udp.Payload[0] >= 0xC0)")) {
             return false;
         }
     }
 
-    (void)need_or;
     if (!append_str(buf, buf_len, &pos, ")")) return false;
     return true;
 }
 
 /* ============================================================================
- * Packet Sending Primitives (Zero Malloc in Hot Path)
+ * Packet Sending Primitives (Exact GoodbyeDPI Native/Reverse Frag & Fake Logic)
  * ========================================================================== */
 
 static bool should_bypass_host(const DpiEngine *eng, const char *host) {
@@ -502,7 +524,7 @@ static void send_tcp_segment_raw(HANDLE wd,
                                  PWINDIVERT_IPHDR orig_ip, PWINDIVERT_IPV6HDR orig_ipv6,
                                  PWINDIVERT_TCPHDR orig_tcp,
                                  const uint8_t *seg_data, size_t seg_len,
-                                 uint32_t seq_delta, uint16_t id_delta, bool keep_psh,
+                                 uint32_t seq_delta,
                                  const WINDIVERT_ADDRESS *orig_addr,
                                  uint8_t *scratch_buf) {
     if (hdr_len + seg_len > JAPONDPI_PACKET_BUF) return;
@@ -518,20 +540,19 @@ static void send_tcp_segment_raw(HANDLE wd,
     if (orig_ip) {
         PWINDIVERT_IPHDR ip = (PWINDIVERT_IPHDR)scratch_buf;
         ip->Length = htons((uint16_t)new_len);
-        ip->Id = htons((uint16_t)(ntohs(orig_ip->Id) + id_delta));
     } else if (orig_ipv6) {
         PWINDIVERT_IPV6HDR ipv6 = (PWINDIVERT_IPV6HDR)scratch_buf;
         ipv6->Length = htons((uint16_t)(new_len - 40));
     }
 
+    /* Exact GoodbyeDPI behavior: preserve original PSH flag & IP.Id so the remote TCP stack
+     * immediately combines reverse-ordered fragments and delivers the intact ClientHello in 0 ms! */
     tcp->SeqNum = htonl(ntohl(orig_tcp->SeqNum) + seq_delta);
-    tcp->Psh = keep_psh ? orig_tcp->Psh : 0;
 
     WINDIVERT_ADDRESS addr = *orig_addr;
     addr.IPChecksum  = 0;
     addr.TCPChecksum = 0;
-    g_wd.HelperCalcChecksums(scratch_buf, new_len, &addr,
-        WINDIVERT_HELPER_NO_ICMP_CHECKSUM | WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM | WINDIVERT_HELPER_NO_UDP_CHECKSUM);
+    g_wd.HelperCalcChecksums(scratch_buf, new_len, &addr, 0);
 
     g_wd.Send(wd, scratch_buf, new_len, NULL, &addr);
 }
@@ -541,32 +562,76 @@ static void send_tcp_segment(HANDLE wd,
                              PWINDIVERT_IPHDR orig_ip, PWINDIVERT_IPV6HDR orig_ipv6,
                              PWINDIVERT_TCPHDR orig_tcp,
                              const uint8_t *seg_data, size_t seg_len,
-                             uint32_t seq_delta, uint16_t id_delta, bool keep_psh,
+                             uint32_t seq_delta,
                              const WINDIVERT_ADDRESS *orig_addr,
                              uint8_t *scratch_buf) {
-    /* LSO/TSO safety: ensure injected TCP chunks never exceed standard Ethernet/PPPoE MTU */
+    /* LSO/TSO safety: ensure injected TCP chunks never exceed standard PPPoE/Ethernet MTU */
     const size_t max_chunk = 1400;
     if (seg_len <= max_chunk) {
         send_tcp_segment_raw(wd, orig_pkt, hdr_len, tcp_offset, orig_ip, orig_ipv6, orig_tcp,
-                             seg_data, seg_len, seq_delta, id_delta, keep_psh, orig_addr, scratch_buf);
+                             seg_data, seg_len, seq_delta, orig_addr, scratch_buf);
         return;
     }
 
     size_t sent = 0;
-    uint16_t sub_id = 0;
     while (sent < seg_len) {
         size_t chunk = seg_len - sent;
         if (chunk > max_chunk) chunk = max_chunk;
-        bool is_final = (sent + chunk >= seg_len);
         send_tcp_segment_raw(wd, orig_pkt, hdr_len, tcp_offset, orig_ip, orig_ipv6, orig_tcp,
                              seg_data + sent, chunk,
                              seq_delta + (uint32_t)sent,
-                             (uint16_t)(id_delta + sub_id),
-                             is_final ? keep_psh : false,
                              orig_addr, scratch_buf);
         sent += chunk;
-        sub_id++;
     }
+}
+
+static void send_single_fake(DpiEngine *eng,
+                             const uint8_t *orig_pkt, size_t hdr_len, size_t tcp_offset,
+                             PWINDIVERT_IPHDR orig_ip, PWINDIVERT_IPV6HDR orig_ipv6,
+                             PWINDIVERT_TCPHDR orig_tcp,
+                             const uint8_t *fake_data, size_t fake_len,
+                             uint8_t set_ttl, bool set_bad_chksum, bool set_bad_seq,
+                             const WINDIVERT_ADDRESS *orig_addr,
+                             uint8_t *scratch_buf) {
+    if (hdr_len + fake_len > JAPONDPI_PACKET_BUF) return;
+
+    memcpy(scratch_buf, orig_pkt, hdr_len);
+    memcpy(scratch_buf + hdr_len, fake_data, fake_len);
+    UINT new_len = (UINT)(hdr_len + fake_len);
+
+    PWINDIVERT_TCPHDR tcp = (PWINDIVERT_TCPHDR)(scratch_buf + tcp_offset);
+    if (orig_ip) {
+        PWINDIVERT_IPHDR ip = (PWINDIVERT_IPHDR)scratch_buf;
+        ip->Length = htons((uint16_t)new_len);
+        if (set_ttl > 0) {
+            ip->TTL = set_ttl;
+        }
+    } else if (orig_ipv6) {
+        PWINDIVERT_IPV6HDR ipv6 = (PWINDIVERT_IPV6HDR)scratch_buf;
+        ipv6->Length = htons((uint16_t)(new_len - 40));
+        if (set_ttl > 0) {
+            ipv6->HopLimit = set_ttl;
+        }
+    }
+
+    if (set_bad_seq) {
+        tcp->AckNum = htonl(ntohl(orig_tcp->AckNum) - 66000U);
+        tcp->SeqNum = htonl(ntohl(orig_tcp->SeqNum) - 10000U);
+    }
+
+    WINDIVERT_ADDRESS fake_addr = *orig_addr;
+    fake_addr.IPChecksum  = 0;
+    fake_addr.TCPChecksum = 0;
+    g_wd.HelperCalcChecksums(scratch_buf, new_len, &fake_addr, 0);
+
+    if (set_bad_chksum) {
+        /* Exact GoodbyeDPI checksum corruption (leaves fake_addr.TCPChecksum=1 so NIC won't fix it) */
+        tcp->Checksum = htons((uint16_t)(ntohs(tcp->Checksum) - 1));
+        fake_addr.TCPChecksum = 1;
+    }
+
+    g_wd.Send(eng->wd_handle, scratch_buf, new_len, NULL, &fake_addr);
+    InterlockedIncrement64(&eng->stats.fake_sent);
 }
 
 static void send_fake_packets(DpiEngine *eng,
@@ -578,226 +643,68 @@ static void send_fake_packets(DpiEngine *eng,
                               uint8_t *scratch_buf) {
     const JaponConfig *cfg = &eng->cfg;
     if (!fake_data || fake_len == 0) return;
-    if (hdr_len + fake_len > JAPONDPI_PACKET_BUF) return;
 
-    /* Resolve effective fake TTL */
     uint8_t eff_ttl = cfg->fake_ttl;
-    if (cfg->auto_ttl) {
+    bool ttl_allowed = (eff_ttl > 0);
+
+    if (cfg->auto_ttl || cfg->min_ttl > 0) {
         uint32_t remote_ip[4] = {0};
         bool is_v6 = (orig_ipv6 != NULL);
-        if (!is_v6 && orig_ip) {
-            remote_ip[0] = orig_ip->DstAddr;
-        } else if (orig_ipv6) {
-            memcpy(remote_ip, orig_ipv6->DstAddr, 16);
-        }
+        if (!is_v6 && orig_ip) remote_ip[0] = orig_ip->DstAddr;
+        else if (orig_ipv6) memcpy(remote_ip, orig_ipv6->DstAddr, 16);
+
         uint8_t synack_ttl = 0;
         if (ttl_cache_lookup(&eng->ttl_cache, is_v6, remote_ip,
                              orig_tcp->DstPort, orig_tcp->SrcPort, &synack_ttl)) {
-            uint8_t auto_t = ttl_compute_auto_fake(synack_ttl,
-                cfg->auto_ttl_delta, cfg->auto_ttl_min, cfg->auto_ttl_max);
-            if (auto_t > 0) {
-                eff_ttl = auto_t;
+            if (cfg->auto_ttl) {
+                eff_ttl = ttl_compute_auto_fake(synack_ttl,
+                    cfg->auto_ttl_1, cfg->auto_ttl_2, cfg->min_ttl, cfg->auto_ttl_max);
+                ttl_allowed = (eff_ttl > 0);
+            } else if (cfg->min_ttl > 0) {
+                if (!ttl_compute_auto_fake(synack_ttl, 0, 0, cfg->min_ttl, 0)) {
+                    ttl_allowed = false;
+                }
             }
+        } else if (cfg->auto_ttl) {
+            /* SYN-ACK not cached -> skip TTL fake safely unless fixed fallback set */
+            ttl_allowed = (eff_ttl > 0);
         }
-    }
-
-    /* Safety guard: NEVER inject a fake packet without at least one fooling method! */
-    if (eff_ttl == 0 && !cfg->wrong_checksum && !cfg->wrong_seq) {
-        return;
-    }
-
-    memcpy(scratch_buf, orig_pkt, hdr_len);
-    memcpy(scratch_buf + hdr_len, fake_data, fake_len);
-    UINT new_len = (UINT)(hdr_len + fake_len);
-
-    PWINDIVERT_TCPHDR tcp = (PWINDIVERT_TCPHDR)(scratch_buf + tcp_offset);
-    if (orig_ip) {
-        PWINDIVERT_IPHDR ip = (PWINDIVERT_IPHDR)scratch_buf;
-        ip->Length = htons((uint16_t)new_len);
-        ip->Id = htons((uint16_t)(ntohs(orig_ip->Id) - 1));
-        if (eff_ttl > 0) {
-            ip->TTL = eff_ttl;
-        }
-    } else if (orig_ipv6) {
-        PWINDIVERT_IPV6HDR ipv6 = (PWINDIVERT_IPV6HDR)scratch_buf;
-        ipv6->Length = htons((uint16_t)(new_len - 40));
-        if (eff_ttl > 0) {
-            ipv6->HopLimit = eff_ttl;
-        }
-    }
-
-    if (cfg->wrong_seq) {
-        tcp->SeqNum = htonl(ntohl(orig_tcp->SeqNum) - 10000U);
-        tcp->AckNum = htonl(ntohl(orig_tcp->AckNum) - 66000U);
-    }
-
-    WINDIVERT_ADDRESS fake_addr = *orig_addr;
-    fake_addr.IPChecksum  = 0;
-    fake_addr.TCPChecksum = 0;
-    g_wd.HelperCalcChecksums(scratch_buf, new_len, &fake_addr,
-        WINDIVERT_HELPER_NO_ICMP_CHECKSUM | WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM | WINDIVERT_HELPER_NO_UDP_CHECKSUM);
-
-    if (cfg->wrong_checksum) {
-        /* Keep fake_addr.TCPChecksum == 1 so NDIS/NIC offload does NOT recalculate & fix it! */
-        tcp->Checksum = (uint16_t)(tcp->Checksum ^ 0xA55A);
-        fake_addr.TCPChecksum = 1;
     }
 
     uint8_t reps = cfg->fake_repeats;
     if (reps < 1) reps = 1;
     if (reps > 10) reps = 10;
 
+    /* Exact GoodbyeDPI fakepackets.c logic: each fooling method sends its OWN fake packet! */
     for (uint8_t r = 0; r < reps; r++) {
-        g_wd.Send(eng->wd_handle, scratch_buf, new_len, NULL, &fake_addr);
-        InterlockedIncrement64(&eng->stats.fake_sent);
+        if (ttl_allowed && eff_ttl > 0) {
+            send_single_fake(eng, orig_pkt, hdr_len, tcp_offset, orig_ip, orig_ipv6, orig_tcp,
+                             fake_data, fake_len, eff_ttl, false, false, orig_addr, scratch_buf);
+        }
+        if (cfg->wrong_checksum) {
+            send_single_fake(eng, orig_pkt, hdr_len, tcp_offset, orig_ip, orig_ipv6, orig_tcp,
+                             fake_data, fake_len, 0, true, false, orig_addr, scratch_buf);
+        }
+        if (cfg->wrong_seq) {
+            send_single_fake(eng, orig_pkt, hdr_len, tcp_offset, orig_ip, orig_ipv6, orig_tcp,
+                             fake_data, fake_len, 0, false, true, orig_addr, scratch_buf);
+        }
     }
 }
 
-static void send_quic_port_unreachable(HANDLE wd,
-                                       const uint8_t *orig_pkt, UINT orig_len,
-                                       PWINDIVERT_IPHDR orig_ip, PWINDIVERT_IPV6HDR orig_ipv6,
-                                       const WINDIVERT_ADDRESS *orig_addr,
-                                       uint8_t *scratch_buf) {
-    /* Injects a local inbound ICMP/ICMPv6 Port Unreachable so browsers/Discord immediately
-     * abort HTTP/3 QUIC (<1 ms) and fall back to TCP/443 instead of stalling for UDP timeout. */
-    if (orig_ip) {
-        size_t orig_ip_len = (size_t)orig_ip->HdrLength * 4;
-        if (orig_ip_len < 20 || orig_ip_len + 8 > orig_len) return;
-        size_t copy_len = orig_ip_len + 8; /* Original IP header + 8-byte UDP header */
-        UINT new_len = (UINT)(20 + 8 + copy_len);
-        if (new_len > JAPONDPI_PACKET_BUF) return;
-
-        memset(scratch_buf, 0, 28);
-        PWINDIVERT_IPHDR ip = (PWINDIVERT_IPHDR)scratch_buf;
-        ip->Version   = 4;
-        ip->HdrLength = 5;
-        ip->Length    = htons((uint16_t)new_len);
-        ip->Id        = htons(0x4A50);
-        ip->TTL       = 64;
-        ip->Protocol  = 1; /* ICMP */
-        ip->SrcAddr   = orig_ip->DstAddr;
-        ip->DstAddr   = orig_ip->SrcAddr;
-
-        PWINDIVERT_ICMPHDR icmp = (PWINDIVERT_ICMPHDR)(scratch_buf + 20);
-        icmp->Type = 3; /* Destination Unreachable */
-        icmp->Code = 3; /* Port Unreachable */
-
-        memcpy(scratch_buf + 28, orig_pkt, copy_len);
-
-        WINDIVERT_ADDRESS raddr = *orig_addr;
-        raddr.Outbound    = 0;
-        raddr.IPChecksum  = 0;
-        raddr.TCPChecksum = 0;
-        raddr.UDPChecksum = 0;
-        g_wd.HelperCalcChecksums(scratch_buf, new_len, &raddr,
-            WINDIVERT_HELPER_NO_TCP_CHECKSUM | WINDIVERT_HELPER_NO_UDP_CHECKSUM |
-            WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM);
-        g_wd.Send(wd, scratch_buf, new_len, NULL, &raddr);
-    } else if (orig_ipv6) {
-        if (orig_len < 48) return;
-        size_t copy_len = 48; /* 40-byte IPv6 header + 8-byte UDP header */
-        UINT new_len = (UINT)(40 + 8 + copy_len);
-
-        memset(scratch_buf, 0, 48);
-        PWINDIVERT_IPV6HDR ip6 = (PWINDIVERT_IPV6HDR)scratch_buf;
-        ip6->Version  = 6;
-        ip6->Length   = htons((uint16_t)(8 + copy_len));
-        ip6->NextHdr  = 58; /* ICMPv6 */
-        ip6->HopLimit = 64;
-        memcpy(ip6->SrcAddr, orig_ipv6->DstAddr, 16);
-        memcpy(ip6->DstAddr, orig_ipv6->SrcAddr, 16);
-
-        PWINDIVERT_ICMPV6HDR icmp6 = (PWINDIVERT_ICMPV6HDR)(scratch_buf + 40);
-        icmp6->Type = 1; /* Destination Unreachable */
-        icmp6->Code = 4; /* Port Unreachable */
-
-        memcpy(scratch_buf + 48, orig_pkt, copy_len);
-
-        WINDIVERT_ADDRESS raddr = *orig_addr;
-        raddr.Outbound    = 0;
-        raddr.IPChecksum  = 0;
-        raddr.TCPChecksum = 0;
-        raddr.UDPChecksum = 0;
-        g_wd.HelperCalcChecksums(scratch_buf, new_len, &raddr,
-            WINDIVERT_HELPER_NO_IP_CHECKSUM | WINDIVERT_HELPER_NO_TCP_CHECKSUM |
-            WINDIVERT_HELPER_NO_UDP_CHECKSUM | WINDIVERT_HELPER_NO_ICMP_CHECKSUM);
-        g_wd.Send(wd, scratch_buf, new_len, NULL, &raddr);
+static bool is_passive_http_redirect(const uint8_t *payload, UINT payload_len) {
+    if (!payload || payload_len < 32) return false;
+    if (memcmp(payload, "HTTP/1.1 302 ", 13) != 0 &&
+        memcmp(payload, "HTTP/1.0 302 ", 13) != 0) {
+        return false;
     }
-}
-
-static bool handle_inbound_passive_dpi(DpiEngine *eng,
-                                       PWINDIVERT_IPHDR ip_hdr, PWINDIVERT_IPV6HDR ipv6_hdr,
-                                       PWINDIVERT_TCPHDR tcp_hdr,
-                                       const uint8_t *payload, UINT payload_len) {
-    /* Return true to DROP spoofed DPI packet, false to allow */
-    if (!eng->cfg.passive_block) return false;
-
-    uint32_t remote_ip[4] = {0};
-    bool is_v6 = (ipv6_hdr != NULL);
-    uint8_t pkt_ttl = 0;
-    if (!is_v6 && ip_hdr) {
-        remote_ip[0] = ip_hdr->SrcAddr;
-        pkt_ttl = ip_hdr->TTL;
-    } else if (ipv6_hdr) {
-        memcpy(remote_ip, ipv6_hdr->SrcAddr, 16);
-        pkt_ttl = ipv6_hdr->HopLimit;
+    /* Match GoodbyeDPI's exact passive DPI redirect heuristic: Location: http:// + Connection: close */
+    bool has_loc = false, has_close = false;
+    for (UINT i = 13; i + 19 <= payload_len; i++) {
+        if (!has_loc && memcmp(payload + i, "\r\nLocation: http://", 19) == 0) has_loc = true;
+        if (!has_close && memcmp(payload + i, "\r\nConnection: close", 19) == 0) has_close = true;
+        if (has_loc && has_close) return true;
     }
-
-    /* 1. Spoofed TCP RST check:
-     *    Compare RST TTL against recorded SYN-ACK TTL for the exact same flow.
-     *    A legitimate server's RST arrives with ~same TTL (+-2); ISP DPI box sits much closer (+6..+40 higher TTL)! */
-    if (tcp_hdr->Rst && payload_len == 0) {
-        uint8_t synack_ttl = 0;
-        if (ttl_cache_lookup(&eng->ttl_cache, is_v6, remote_ip,
-                             tcp_hdr->SrcPort, tcp_hdr->DstPort, &synack_ttl)) {
-            int diff = (int)pkt_ttl - (int)synack_ttl;
-            if (diff < 0) diff = -diff;
-            if (diff >= 6) {
-                InterlockedIncrement64(&eng->stats.passive_dropped);
-                if (eng->cfg.verbose) {
-                    printf("[PASIF-DPI] Sahte RST engellendi (SYN-ACK TTL=%u, RST TTL=%u)\n",
-                           (unsigned)synack_ttl, (unsigned)pkt_ttl);
-                }
-                return true;
-            }
-        }
-        /* Classic passive DPI injector signature on IPv4: DF=0 and IP.Id == 0 or 1 */
-        if (ip_hdr && !WINDIVERT_IPHDR_GET_DF(ip_hdr)) {
-            uint16_t id = ntohs(ip_hdr->Id);
-            if (id == 0 || id == 1) {
-                InterlockedIncrement64(&eng->stats.passive_dropped);
-                return true;
-            }
-        }
-    }
-
-    /* 2. Spoofed HTTP 302/307 ISP Block Redirect check */
-    if (payload && payload_len >= 16 && memcmp(payload, "HTTP/1.", 7) == 0) {
-        if (memcmp(payload + 9, "302", 3) == 0 || memcmp(payload + 9, "307", 3) == 0) {
-            bool suspicious = false;
-            if (ip_hdr && !WINDIVERT_IPHDR_GET_DF(ip_hdr)) {
-                uint16_t id = ntohs(ip_hdr->Id);
-                if (id == 0 || id == 1) suspicious = true;
-            }
-            if (!suspicious) {
-                uint8_t synack_ttl = 0;
-                if (ttl_cache_lookup(&eng->ttl_cache, is_v6, remote_ip,
-                                     tcp_hdr->SrcPort, tcp_hdr->DstPort, &synack_ttl)) {
-                    int diff = (int)pkt_ttl - (int)synack_ttl;
-                    if (diff < 0) diff = -diff;
-                    if (diff >= 6) suspicious = true;
-                }
-            }
-            if (suspicious) {
-                InterlockedIncrement64(&eng->stats.passive_dropped);
-                if (eng->cfg.verbose) {
-                    printf("[PASIF-DPI] Sahte HTTP 302/307 yonlendirmesi engellendi.\n");
-                }
-                return true;
-            }
-        }
-    }
-
     return false;
 }
 
@@ -807,8 +714,10 @@ static bool handle_inbound_passive_dpi(DpiEngine *eng,
 
 bool dpi_engine_init(DpiEngine *eng, const JaponConfig *cfg, char *err_buf, size_t err_len) {
     memset(eng, 0, sizeof(*eng));
-    eng->cfg = *cfg;
-    eng->wd_handle = INVALID_HANDLE_VALUE;
+    eng->cfg             = *cfg;
+    eng->wd_handle       = INVALID_HANDLE_VALUE;
+    eng->wd_drop_passive = INVALID_HANDLE_VALUE;
+    eng->wd_drop_quic    = INVALID_HANDLE_VALUE;
 
     fake_payloads_init(&eng->fakes, cfg->fake_sni, cfg->fake_http_host);
     ttl_cache_init(&eng->ttl_cache);
@@ -836,13 +745,18 @@ bool dpi_engine_init(DpiEngine *eng, const JaponConfig *cfg, char *err_buf, size
     return true;
 }
 
-void dpi_engine_destroy(DpiEngine *eng) {
-    if (eng->wd_handle != INVALID_HANDLE_VALUE && eng->wd_handle != NULL) {
-        if (g_wd.Close) {
-            g_wd.Close(eng->wd_handle);
-        }
-        eng->wd_handle = INVALID_HANDLE_VALUE;
+static void close_wd_handle(HANDLE *ph) {
+    if (*ph != INVALID_HANDLE_VALUE && *ph != NULL) {
+        if (g_wd.Shutdown) g_wd.Shutdown(*ph, WINDIVERT_SHUTDOWN_BOTH);
+        if (g_wd.Close)    g_wd.Close(*ph);
+        *ph = INVALID_HANDLE_VALUE;
     }
+}
+
+void dpi_engine_destroy(DpiEngine *eng) {
+    close_wd_handle(&eng->wd_drop_passive);
+    close_wd_handle(&eng->wd_drop_quic);
+    close_wd_handle(&eng->wd_handle);
     domain_list_free(&eng->blacklist);
     domain_list_free(&eng->whitelist);
 }
@@ -856,7 +770,25 @@ void dpi_engine_request_stop(DpiEngine *eng) {
 }
 
 int dpi_engine_run(DpiEngine *eng) {
-    char filter[2048];
+    /* Flush Windows DNS cache right inside C (works in Windows Service mode too!) */
+    if (eng->cfg.dns_redir_v4 || eng->cfg.dns_redir_v6) {
+        dns_flush_system_cache();
+    }
+
+    /* 1. Optional kernel-only DROP handle for -p passive RSTs (zero user-mode overhead) */
+    if (eng->cfg.passive_block) {
+        eng->wd_drop_passive = g_wd.Open(FILTER_KERNEL_DROP_PASSIVE_RST,
+                                         WINDIVERT_LAYER_NETWORK, 0, WINDIVERT_FLAG_DROP);
+    }
+
+    /* 2. Optional kernel-only DROP handle for -q QUIC when no whitelist is active */
+    if (eng->cfg.block_quic && !eng->has_whitelist) {
+        eng->wd_drop_quic = g_wd.Open(FILTER_KERNEL_DROP_QUIC,
+                                      WINDIVERT_LAYER_NETWORK, 0, WINDIVERT_FLAG_DROP);
+    }
+
+    /* 3. Main active DPI filter */
+    char filter[4096];
     if (!dpi_build_filter(&eng->cfg, filter, sizeof(filter))) {
         fprintf(stderr, "[HATA] WinDivert filtre ifadesi olusturulamadi.\n");
         return 1;
@@ -881,13 +813,8 @@ int dpi_engine_run(DpiEngine *eng) {
                     fpos, ferr ? ferr : "bilinmiyor", filter);
         } else if (err == ERROR_INVALID_IMAGE_HASH) {
             fprintf(stderr,
-                "[HATA] WinDivert64.sys dijital imzasi Windows tarafindan dogrulanamadi (Kod: %lu).\n"
-                "Resmi WHQL imzali WinDivert 2.2.2-A surumunu kullandiginizdan emin olun.\n",
+                "[HATA] WinDivert64.sys dijital imzasi Windows tarafindan dogrulanamadi (Kod: %lu).\n",
                 (unsigned long)err);
-        } else if (err == ERROR_SERVICE_MARKED_FOR_DELETE) {
-            fprintf(stderr,
-                "[HATA] Eski WinDivert surucusu henuz kapanmamis.\n"
-                "Bilgisayari yeniden baslatin veya 'sc stop WinDivert' komutunu calistirin.\n");
         } else {
             fprintf(stderr, "[HATA] WinDivertOpen basarisiz oldu (Windows Hata Kodu: %lu).\n",
                     (unsigned long)err);
@@ -897,20 +824,19 @@ int dpi_engine_run(DpiEngine *eng) {
 
     eng->wd_handle = wd;
 
-    /* Tune WinDivert kernel queue for high throughput and zero packet drops */
+    /* High-performance kernel queue tuning */
     g_wd.SetParam(wd, WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
     g_wd.SetParam(wd, WINDIVERT_PARAM_QUEUE_TIME,   2000);
-    g_wd.SetParam(wd, WINDIVERT_PARAM_QUEUE_SIZE,   8388608); /* 8 MB */
+    g_wd.SetParam(wd, WINDIVERT_PARAM_QUEUE_SIZE,   8388608);
 
-    /* Raise process priority slightly so handshake packets experience <0.1 ms latency */
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
     if (!eng->cfg.quiet && !eng->cfg.run_as_service) {
-        printf("[AKTIF] Japon DPI calisiyor! Durdurmak icin Ctrl+C tuslarina basin.\n");
+        printf("[AKTIF] Japon DPI v%s calisiyor! Durdurmak icin Ctrl+C tuslarina basin.\n",
+               JAPONDPI_VERSION);
         fflush(stdout);
     }
 
-    /* Pre-allocated packet buffers: ZERO malloc/free in the hot packet loop */
     uint8_t *pkt_buf     = (uint8_t *)malloc(JAPONDPI_PACKET_BUF);
     uint8_t *scratch_buf = (uint8_t *)malloc(JAPONDPI_PACKET_BUF);
     if (!pkt_buf || !scratch_buf) {
@@ -928,7 +854,7 @@ int dpi_engine_run(DpiEngine *eng) {
             DWORD err = GetLastError();
             if (err == ERROR_NO_DATA || err == ERROR_OPERATION_ABORTED ||
                 InterlockedCompareExchange(&eng->stop_flag, 0, 0)) {
-                break; /* Clean shutdown triggered */
+                break;
             }
             continue;
         }
@@ -952,28 +878,17 @@ int dpi_engine_run(DpiEngine *eng) {
         const uint8_t *payload = (const uint8_t *)data_ptr;
         bool outbound = (addr.Outbound != 0);
 
-        /* ---- 1. UDP Handling: DNS Redirection & QUIC Blocking ---- */
+        /* ---- 1. UDP Handling: DNS Redirection & Selective QUIC Blocking ---- */
         if (udp_hdr) {
-            if (outbound && eng->cfg.block_quic && udp_hdr->DstPort == htons(443)) {
-                if (dpi_is_quic_initial(payload, data_len)) {
-                    bool skip_quic_block = false;
-                    if (eng->has_whitelist) {
-                        uint32_t dst_ip[4] = {0};
-                        bool is_v6 = (ipv6_hdr != NULL);
-                        if (!is_v6 && ip_hdr) dst_ip[0] = ip_hdr->DstAddr;
-                        else if (ipv6_hdr) memcpy(dst_ip, ipv6_hdr->DstAddr, 16);
-                        if (dpi_ip_wl_contains(&eng->ip_wl, is_v6, dst_ip)) {
-                            skip_quic_block = true;
-                        }
-                    }
-                    if (!skip_quic_block) {
-                        InterlockedIncrement64(&eng->stats.quic_blocked);
-                        send_quic_port_unreachable(wd, pkt_buf, pkt_len, ip_hdr, ipv6_hdr, &addr, scratch_buf);
-                        if (eng->cfg.verbose) {
-                            printf("[QUIC] UDP:443 QUIC Initial engellendi -> aninda TCP/443 fallback\n");
-                        }
-                        continue; /* drop QUIC Initial */
-                    }
+            if (outbound && eng->cfg.block_quic && eng->has_whitelist &&
+                udp_hdr->DstPort == htons(443) && dpi_is_quic_initial(payload, data_len)) {
+                uint32_t dst_ip[4] = {0};
+                bool is_v6 = (ipv6_hdr != NULL);
+                if (!is_v6 && ip_hdr) dst_ip[0] = ip_hdr->DstAddr;
+                else if (ipv6_hdr) memcpy(dst_ip, ipv6_hdr->DstAddr, 16);
+                if (!dpi_ip_wl_contains(&eng->ip_wl, is_v6, dst_ip)) {
+                    InterlockedIncrement64(&eng->stats.quic_blocked);
+                    continue; /* drop QUIC Initial for non-whitelisted host */
                 }
             }
 
@@ -981,16 +896,14 @@ int dpi_engine_run(DpiEngine *eng) {
                                            outbound, ip_hdr, ipv6_hdr, udp_hdr,
                                            payload, data_len);
             if (dns_rc < 0) {
-                continue; /* dropped (e.g., --block-dnsv6) */
+                continue;
             } else if (dns_rc > 0) {
                 if (!outbound && eng->has_whitelist) {
                     dpi_dns_learn_whitelist_ips(payload, data_len, &eng->whitelist, &eng->ip_wl);
                 }
                 addr.IPChecksum  = 0;
                 addr.UDPChecksum = 0;
-                g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr,
-                    WINDIVERT_HELPER_NO_ICMP_CHECKSUM | WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM |
-                    WINDIVERT_HELPER_NO_TCP_CHECKSUM);
+                g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr, 0);
                 g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
                 continue;
             }
@@ -1005,7 +918,7 @@ int dpi_engine_run(DpiEngine *eng) {
             continue;
         }
 
-        /* 2A. Inbound TCP: SYN-ACK TTL tracking, TCP Window shrink, Passive DPI block */
+        /* 2A. Inbound TCP: SYN-ACK TTL tracking, Window Size, Passive HTTP 302 block */
         if (!outbound) {
             if (tcp_hdr->Syn && tcp_hdr->Ack) {
                 uint32_t remote_ip[4] = {0};
@@ -1025,16 +938,15 @@ int dpi_engine_run(DpiEngine *eng) {
                     tcp_hdr->Window = htons(eng->cfg.window_size);
                     addr.IPChecksum  = 0;
                     addr.TCPChecksum = 0;
-                    g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr,
-                        WINDIVERT_HELPER_NO_ICMP_CHECKSUM | WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM |
-                        WINDIVERT_HELPER_NO_UDP_CHECKSUM);
+                    g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr, 0);
                 }
                 g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
                 continue;
             }
 
-            if (handle_inbound_passive_dpi(eng, ip_hdr, ipv6_hdr, tcp_hdr, payload, data_len)) {
-                continue; /* dropped spoofed RST / 302 */
+            if (eng->cfg.passive_block && is_passive_http_redirect(payload, data_len)) {
+                InterlockedIncrement64(&eng->stats.passive_dropped);
+                continue;
             }
 
             g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
@@ -1051,15 +963,17 @@ int dpi_engine_run(DpiEngine *eng) {
         size_t tcp_offset = (size_t)((const uint8_t *)tcp_hdr - pkt_buf);
 
         /* ---- Outbound HTTPS / TLS ClientHello ---- */
-        if (data_len >= 6 && payload[0] == 0x16 && payload[1] == 0x03 && payload[5] == 0x01) {
+        if (data_len >= 6 && payload[0] == 0x16 && payload[1] == 0x03 &&
+            payload[2] <= 0x03 && payload[5] == 0x01) {
             TlsParseResult tls;
-            if (!dpi_parse_tls_client_hello(payload, data_len, &tls)) {
-                g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
-                continue;
+            memset(&tls, 0, sizeof(tls));
+            /* Only parse SNI if blacklist, whitelist, frag_by_sni, multi_split, or verbose need it! */
+            if (eng->has_blacklist || eng->has_whitelist ||
+                eng->cfg.frag_by_sni || eng->cfg.multi_split || eng->cfg.verbose) {
+                dpi_parse_tls_client_hello(payload, data_len, &tls);
             }
 
             if (!should_bypass_host(eng, tls.found_sni ? tls.sni_host : "")) {
-                /* Also cache whitelisted server IP so subsequent QUIC 0-RTT is allowed */
                 if (eng->has_whitelist && tls.found_sni &&
                     domain_list_matches(&eng->whitelist, tls.sni_host)) {
                     uint32_t dst_ip[4] = {0};
@@ -1078,7 +992,7 @@ int dpi_engine_run(DpiEngine *eng) {
                               eng->fakes.tls_buf, eng->fakes.tls_len,
                               &addr, scratch_buf);
 
-            /* Step 2: Determine split point(s) */
+            /* Step 2: Determine split point(s) (exact GoodbyeDPI semantics) */
             size_t cut1 = 0, cut2 = 0;
             if (eng->cfg.multi_split && data_len > 6) {
                 cut1 = (eng->cfg.https_frag_size > 0 && eng->cfg.https_frag_size < data_len - 2)
@@ -1089,63 +1003,60 @@ int dpi_engine_run(DpiEngine *eng) {
                 } else if (data_len > cut1 + 24) {
                     cut2 = cut1 + 20;
                 }
-            } else if (eng->cfg.split_sni && tls.found_sni &&
-                       tls.sni_offset + tls.sni_len / 2 > 0 &&
-                       tls.sni_offset + tls.sni_len / 2 < data_len) {
-                cut1 = tls.sni_offset + tls.sni_len / 2;
+            } else if (eng->cfg.frag_by_sni && tls.found_sni &&
+                       tls.sni_offset > 0 && tls.sni_offset < data_len) {
+                /* Exact GoodbyeDPI --frag-by-sni: cut right before SNI (or mid-SNI) */
+                cut1 = tls.sni_offset + (tls.sni_len / 2);
             } else if (eng->cfg.https_frag_size > 0 && eng->cfg.https_frag_size < data_len) {
                 cut1 = eng->cfg.https_frag_size;
-            } else if (eng->cfg.split_sni && data_len > 2) {
-                /* Fallback when ML-KEM pushes SNI into next TCP segment */
+            } else if (eng->cfg.frag_by_sni && data_len > 2) {
                 cut1 = 2;
             }
 
             if (cut1 > 0 && cut2 > cut1 && cut2 < data_len) {
-                /* 3-part split */
                 size_t len0 = cut1;
                 size_t len1 = cut2 - cut1;
                 size_t len2 = data_len - cut2;
 
                 if (eng->cfg.reverse_frag) {
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut2, len2, (uint32_t)cut2, 2, true,  &addr, scratch_buf);
+                                     payload + cut2, len2, (uint32_t)cut2, &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut1, len1, (uint32_t)cut1, 1, false, &addr, scratch_buf);
+                                     payload + cut1, len1, (uint32_t)cut1, &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload,        len0, 0,              0, false, &addr, scratch_buf);
+                                     payload,        len0, 0,              &addr, scratch_buf);
                 } else {
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload,        len0, 0,              0, false, &addr, scratch_buf);
+                                     payload,        len0, 0,              &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut1, len1, (uint32_t)cut1, 1, false, &addr, scratch_buf);
+                                     payload + cut1, len1, (uint32_t)cut1, &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut2, len2, (uint32_t)cut2, 2, true,  &addr, scratch_buf);
+                                     payload + cut2, len2, (uint32_t)cut2, &addr, scratch_buf);
                 }
             } else if (cut1 > 0 && cut1 < data_len) {
-                /* 2-part split */
                 size_t len0 = cut1;
                 size_t len1 = data_len - cut1;
 
                 if (eng->cfg.reverse_frag) {
+                    /* Exact GoodbyeDPI --reverse-frag: [cut1..end) FIRST, [0..cut1) SECOND! */
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut1, len1, (uint32_t)cut1, 1, true,  &addr, scratch_buf);
+                                     payload + cut1, len1, (uint32_t)cut1, &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload,        len0, 0,              0, false, &addr, scratch_buf);
+                                     payload,        len0, 0,              &addr, scratch_buf);
                 } else {
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload,        len0, 0,              0, false, &addr, scratch_buf);
+                                     payload,        len0, 0,              &addr, scratch_buf);
                     send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                     payload + cut1, len1, (uint32_t)cut1, 1, true,  &addr, scratch_buf);
+                                     payload + cut1, len1, (uint32_t)cut1, &addr, scratch_buf);
                 }
             } else {
-                /* No split, pass original packet after fake */
                 g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
             }
 
             InterlockedIncrement64(&eng->stats.tls_bypassed);
             if (eng->cfg.verbose) {
                 printf("[TLS] %s (len=%u, split=%zu%s)\n",
-                       tls.found_sni ? tls.sni_host : "<parcali-sni>",
+                       tls.found_sni ? tls.sni_host : "<tls>",
                        data_len, cut1, eng->cfg.reverse_frag ? ", ters" : "");
             }
             continue;
@@ -1160,35 +1071,31 @@ int dpi_engine_run(DpiEngine *eng) {
                     continue;
                 }
 
-                /* Fake HTTP packet */
                 send_fake_packets(eng, pkt_buf, hdr_len, tcp_offset,
                                   ip_hdr, ipv6_hdr, tcp_hdr,
                                   eng->fakes.http_buf, eng->fakes.http_len,
                                   &addr, scratch_buf);
 
-                /* In-place length-preserving header mutations */
                 bool mutated = dpi_mangle_http_payload((uint8_t *)data_ptr, data_len, &eng->cfg);
 
                 if (eng->cfg.http_frag_size > 0 && eng->cfg.http_frag_size < data_len) {
                     size_t cut = eng->cfg.http_frag_size;
                     if (eng->cfg.reverse_frag) {
                         send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                         payload + cut, data_len - cut, (uint32_t)cut, 1, true,  &addr, scratch_buf);
+                                         payload + cut, data_len - cut, (uint32_t)cut, &addr, scratch_buf);
                         send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                         payload,       cut,            0,             0, false, &addr, scratch_buf);
+                                         payload,       cut,            0,             &addr, scratch_buf);
                     } else {
                         send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                         payload,       cut,            0,             0, false, &addr, scratch_buf);
+                                         payload,       cut,            0,             &addr, scratch_buf);
                         send_tcp_segment(wd, pkt_buf, hdr_len, tcp_offset, ip_hdr, ipv6_hdr, tcp_hdr,
-                                         payload + cut, data_len - cut, (uint32_t)cut, 1, true,  &addr, scratch_buf);
+                                         payload + cut, data_len - cut, (uint32_t)cut, &addr, scratch_buf);
                     }
                 } else {
                     if (mutated) {
                         addr.IPChecksum  = 0;
                         addr.TCPChecksum = 0;
-                        g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr,
-                            WINDIVERT_HELPER_NO_ICMP_CHECKSUM | WINDIVERT_HELPER_NO_ICMPV6_CHECKSUM |
-                            WINDIVERT_HELPER_NO_UDP_CHECKSUM);
+                        g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr, 0);
                     }
                     g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
                 }
@@ -1201,7 +1108,6 @@ int dpi_engine_run(DpiEngine *eng) {
             }
         }
 
-        /* Fallback: pass through unmodified */
         g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
     }
 

@@ -29,7 +29,7 @@ sc delete "JaponDPI" >nul 2>&1
 
 echo Japon DPI servisi (Superonline Alternatif 1) kuruluyor...
 set "WL=%ROOT%\whitelist.txt"
-sc create "JaponDPI" binPath= "\"%EXE%\" --service --set-ttl 3 --fake-repeats 2 --split-sni --reverse-frag -e 2 -f 2 -r -p --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --dns-addr 77.88.8.8 --dns-port 1253 --block-dnsv6 --block-quic --whitelist \"%WL%\"" start= "auto" DisplayName= "Japon DPI"
+sc create "JaponDPI" binPath= "\"%EXE%\" --service -5 --set-ttl 3 --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --dns-addr 77.88.8.8 --dns-port 1253 --dnsv6-addr 2a02:6b8::feed:0ff --dnsv6-port 1253 --whitelist \"%WL%\"" start= "auto" DisplayName= "Japon DPI"
 sc description "JaponDPI" "Japon DPI - Superonline Profili 1 (WinDivert 2.2)"
 sc start "JaponDPI"
 ipconfig /flushdns >nul 2>&1

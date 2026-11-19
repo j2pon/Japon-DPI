@@ -33,7 +33,9 @@ typedef struct {
     IpWhitelistCache ip_wl;
     bool             has_blacklist;
     bool             has_whitelist;
-    HANDLE           wd_handle;
+    HANDLE           wd_handle;       /* main packet filter */
+    HANDLE           wd_drop_passive; /* kernel-only WINDIVERT_FLAG_DROP for -p RSTs */
+    HANDLE           wd_drop_quic;    /* kernel-only WINDIVERT_FLAG_DROP for -q QUIC */
     volatile LONG    stop_flag;
 } DpiEngine;
 

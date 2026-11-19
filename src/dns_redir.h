@@ -26,6 +26,12 @@ typedef struct {
 
 void dns_redir_init(DnsRedirector *dr);
 
+/* Flushes Windows DNS resolver cache via dnsapi.dll!DnsFlushResolverCache (GoodbyeDPI style) */
+bool dns_flush_system_cache(void);
+
+/* Validates DNS query/response header flags (prevents colliding with non-DNS UDP on alt ports) */
+bool dns_is_valid_packet(const uint8_t *payload, UINT payload_len, bool outbound);
+
 /*
  * Processes a UDP DNS packet if DNS redirection applies.
  * Returns:

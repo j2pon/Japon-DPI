@@ -12,10 +12,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [PROFIL] Turkcell Superonline Alternatif 1 (TTL=3 + 2x Fake + Ters SNI Bolme + DNS + Port 2053)
-ipconfig /flushdns >nul 2>&1
+echo [PROFIL] Turkcell Superonline Alternatif 1 (GoodbyeDPI -5 --set-ttl 3 + Yandex DNS:1253)
 echo.
-"%~dp0x86_64\japondpi.exe" --set-ttl 3 --fake-repeats 2 --split-sni --reverse-frag -e 2 -f 2 -r -p --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --dns-addr 77.88.8.8 --dns-port 1253 --block-dnsv6 --block-quic --whitelist "%~dp0whitelist.txt"
+"%~dp0x86_64\japondpi.exe" -5 --set-ttl 3 --port 2053 --port 2083 --port 2087 --port 2096 --port 8443 --dns-addr 77.88.8.8 --dns-port 1253 --dnsv6-addr 2a02:6b8::feed:0ff --dnsv6-port 1253 --whitelist "%~dp0whitelist.txt"
 echo.
 pause
 popd
