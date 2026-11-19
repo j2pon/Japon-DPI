@@ -28,7 +28,8 @@ timeout /t 1 /nobreak >nul
 sc delete "JaponDPI" >nul 2>&1
 
 echo Japon DPI servisi (Genel / Evrensel) kuruluyor...
-sc create "JaponDPI" binPath= "\"%EXE%\" --service -5 --wrong-checksum --wrong-seq --port 2053 --dns-addr 77.88.8.8 --dns-port 1253 --block-dnsv6 --block-quic" start= "auto" DisplayName= "Japon DPI"
+set "WL=%ROOT%\whitelist.txt"
+sc create "JaponDPI" binPath= "\"%EXE%\" --service -5 --wrong-checksum --wrong-seq --port 2053 --dns-addr 208.67.222.222 --dns-port 443 --block-dnsv6 --block-quic --whitelist \"%WL%\"" start= "auto" DisplayName= "Japon DPI"
 sc description "JaponDPI" "Japon DPI - Genel Evrensel Profil (WinDivert 2.2)"
 sc start "JaponDPI"
 ipconfig /flushdns >nul 2>&1

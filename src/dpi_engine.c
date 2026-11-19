@@ -229,6 +229,141 @@ bool dpi_is_quic_initial(const uint8_t *payload, size_t len) {
 }
 
 /* ============================================================================
+ * Whitelisted IP Cache (for 0-RTT QUIC pass-through on YouTube/Google/Games)
+ * ========================================================================== */
+
+#define IP_WL_EXPIRE_MS 600000ULL /* 10 minutes */
+
+static uint32_t ip_wl_hash(bool is_v6, const uint32_t ip[4]) {
+    uint32_t h = 2166136261U;
+    h ^= (uint32_t)(is_v6 ? 1 : 0);
+    h *= 16777619U;
+    int words = is_v6 ? 4 : 1;
+    for (int i = 0; i < words; i++) {
+        h ^= ip[i];
+        h *= 16777619U;
+    }
+    return h & IP_WL_CACHE_MASK;
+}
+
+static void ip_wl_add(IpWhitelistCache *cache, bool is_v6, const uint32_t ip[4]) {
+    uint32_t idx = ip_wl_hash(is_v6, ip);
+    uint64_t now = GetTickCount64();
+    IpWhitelistEntry *slot = &cache->entries[idx];
+    for (uint32_t i = 0; i < 4; i++) {
+        IpWhitelistEntry *e = &cache->entries[(idx + i) & IP_WL_CACHE_MASK];
+        if (!e->valid || (now - e->timestamp_ms) > IP_WL_EXPIRE_MS ||
+            (e->is_v6 == (is_v6 ? 1 : 0) &&
+             (is_v6 ? (memcmp(e->ip, ip, 16) == 0) : (e->ip[0] == ip[0])))) {
+            slot = e;
+            break;
+        }
+    }
+    slot->valid = 1;
+    slot->is_v6 = is_v6 ? 1 : 0;
+    if (is_v6) {
+        memcpy(slot->ip, ip, 16);
+    } else {
+        slot->ip[0] = ip[0];
+        slot->ip[1] = slot->ip[2] = slot->ip[3] = 0;
+    }
+    slot->timestamp_ms = now;
+}
+
+bool dpi_ip_wl_contains(const IpWhitelistCache *cache, bool is_v6, const uint32_t ip[4]) {
+    if (!cache) return false;
+    uint32_t idx = ip_wl_hash(is_v6, ip);
+    uint64_t now = GetTickCount64();
+    for (uint32_t i = 0; i < 4; i++) {
+        const IpWhitelistEntry *e = &cache->entries[(idx + i) & IP_WL_CACHE_MASK];
+        if (e->valid && e->is_v6 == (is_v6 ? 1 : 0) &&
+            (now - e->timestamp_ms) <= IP_WL_EXPIRE_MS) {
+            if (is_v6 ? (memcmp(e->ip, ip, 16) == 0) : (e->ip[0] == ip[0])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void dpi_dns_learn_whitelist_ips(const uint8_t *dns, size_t len,
+                                 const DomainList *whitelist, IpWhitelistCache *ip_wl) {
+    if (!dns || len < 17 || !whitelist || !ip_wl) return;
+    /* Must be a DNS response (QR bit = 1) with no error (RCODE = 0) */
+    if ((dns[2] & 0x80) == 0 || (dns[3] & 0x0F) != 0) return;
+
+    uint16_t qdcount = (uint16_t)(((uint16_t)dns[4] << 8) | dns[5]);
+    uint16_t ancount = (uint16_t)(((uint16_t)dns[6] << 8) | dns[7]);
+    if (qdcount == 0 || ancount == 0) return;
+
+    /* Extract QNAME from Question #1 */
+    char qname[JAPONDPI_MAX_HOST];
+    size_t qlen = 0;
+    size_t pos = 12;
+    while (pos < len) {
+        uint8_t lab = dns[pos++];
+        if (lab == 0) break;
+        if ((lab & 0xC0) != 0 || pos + lab > len) return;
+        if (qlen > 0 && qlen + 1 < sizeof(qname)) {
+            qname[qlen++] = '.';
+        }
+        for (uint8_t i = 0; i < lab; i++) {
+            if (qlen + 1 < sizeof(qname)) {
+                qname[qlen++] = (char)tolower(dns[pos + i]);
+            }
+        }
+        pos += lab;
+    }
+    qname[qlen] = '\0';
+    if (qlen == 0 || pos + 4 > len) return;
+    pos += 4; /* skip QTYPE + QCLASS */
+
+    /* Skip additional questions if any */
+    for (uint16_t q = 1; q < qdcount; q++) {
+        while (pos < len) {
+            uint8_t b = dns[pos++];
+            if (b == 0) break;
+            if ((b & 0xC0) == 0xC0) { pos++; break; }
+            pos += b;
+        }
+        if (pos + 4 > len) return;
+        pos += 4;
+    }
+
+    if (!domain_list_matches(whitelist, qname)) {
+        return;
+    }
+
+    /* Record all A (IPv4) and AAAA (IPv6) answer IPs into IP whitelist cache */
+    uint16_t limit = ancount > 32 ? 32 : ancount;
+    for (uint16_t a = 0; a < limit && pos < len; a++) {
+        /* Skip answer NAME */
+        while (pos < len) {
+            uint8_t b = dns[pos];
+            if (b == 0) { pos++; break; }
+            if ((b & 0xC0) == 0xC0) { pos += 2; break; }
+            pos += 1 + b;
+        }
+        if (pos + 10 > len) break;
+        uint16_t rtype = (uint16_t)(((uint16_t)dns[pos] << 8) | dns[pos + 1]);
+        uint16_t rdlen = (uint16_t)(((uint16_t)dns[pos + 8] << 8) | dns[pos + 9]);
+        pos += 10;
+        if (pos + rdlen > len) break;
+
+        if (rtype == 1 && rdlen == 4) {
+            uint32_t ip4[4] = {0};
+            memcpy(&ip4[0], dns + pos, 4);
+            ip_wl_add(ip_wl, false, ip4);
+        } else if (rtype == 28 && rdlen == 16) {
+            uint32_t ip6[4];
+            memcpy(ip6, dns + pos, 16);
+            ip_wl_add(ip_wl, true, ip6);
+        }
+        pos += rdlen;
+    }
+}
+
+/* ============================================================================
  * WinDivert Kernel Filter Builder
  * ========================================================================== */
 
@@ -821,12 +956,24 @@ int dpi_engine_run(DpiEngine *eng) {
         if (udp_hdr) {
             if (outbound && eng->cfg.block_quic && udp_hdr->DstPort == htons(443)) {
                 if (dpi_is_quic_initial(payload, data_len)) {
-                    InterlockedIncrement64(&eng->stats.quic_blocked);
-                    send_quic_port_unreachable(wd, pkt_buf, pkt_len, ip_hdr, ipv6_hdr, &addr, scratch_buf);
-                    if (eng->cfg.verbose) {
-                        printf("[QUIC] UDP:443 QUIC Initial engellendi -> aninda TCP/443 fallback\n");
+                    bool skip_quic_block = false;
+                    if (eng->has_whitelist) {
+                        uint32_t dst_ip[4] = {0};
+                        bool is_v6 = (ipv6_hdr != NULL);
+                        if (!is_v6 && ip_hdr) dst_ip[0] = ip_hdr->DstAddr;
+                        else if (ipv6_hdr) memcpy(dst_ip, ipv6_hdr->DstAddr, 16);
+                        if (dpi_ip_wl_contains(&eng->ip_wl, is_v6, dst_ip)) {
+                            skip_quic_block = true;
+                        }
                     }
-                    continue; /* drop QUIC Initial */
+                    if (!skip_quic_block) {
+                        InterlockedIncrement64(&eng->stats.quic_blocked);
+                        send_quic_port_unreachable(wd, pkt_buf, pkt_len, ip_hdr, ipv6_hdr, &addr, scratch_buf);
+                        if (eng->cfg.verbose) {
+                            printf("[QUIC] UDP:443 QUIC Initial engellendi -> aninda TCP/443 fallback\n");
+                        }
+                        continue; /* drop QUIC Initial */
+                    }
                 }
             }
 
@@ -836,6 +983,9 @@ int dpi_engine_run(DpiEngine *eng) {
             if (dns_rc < 0) {
                 continue; /* dropped (e.g., --block-dnsv6) */
             } else if (dns_rc > 0) {
+                if (!outbound && eng->has_whitelist) {
+                    dpi_dns_learn_whitelist_ips(payload, data_len, &eng->whitelist, &eng->ip_wl);
+                }
                 addr.IPChecksum  = 0;
                 addr.UDPChecksum = 0;
                 g_wd.HelperCalcChecksums(pkt_buf, pkt_len, &addr,
@@ -909,6 +1059,15 @@ int dpi_engine_run(DpiEngine *eng) {
             }
 
             if (!should_bypass_host(eng, tls.found_sni ? tls.sni_host : "")) {
+                /* Also cache whitelisted server IP so subsequent QUIC 0-RTT is allowed */
+                if (eng->has_whitelist && tls.found_sni &&
+                    domain_list_matches(&eng->whitelist, tls.sni_host)) {
+                    uint32_t dst_ip[4] = {0};
+                    bool is_v6 = (ipv6_hdr != NULL);
+                    if (!is_v6 && ip_hdr) dst_ip[0] = ip_hdr->DstAddr;
+                    else if (ipv6_hdr) memcpy(dst_ip, ipv6_hdr->DstAddr, 16);
+                    ip_wl_add(&eng->ip_wl, is_v6, dst_ip);
+                }
                 g_wd.Send(wd, pkt_buf, pkt_len, NULL, &addr);
                 continue;
             }

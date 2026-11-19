@@ -1,0 +1,29 @@
+# Japon DPI - Beyaz Liste (Whitelist)
+# Bu listedeki alan adlarina DPI parcalama / sahte paket UYGULANMAZ
+# ve QUIC (HTTP/3) 0-RTT hizli gecisleri ENGELLENMEZ.
+# Alt alan adlari otomatik olarak dahil edilir (orn: googlevideo.com -> *.googlevideo.com).
+
+# YouTube & Google (Aninda video gecisi & 0-RTT QUIC)
+youtube.com
+youtu.be
+googlevideo.com
+ytimg.com
+ggpht.com
+google.com
+gstatic.com
+googleapis.com
+
+# Oyun & Yayin & Medya Platformlari
+steampowered.com
+steamstatic.com
+steamcontent.com
+riotgames.com
+epicgames.com
+twitch.tv
+ttvnw.net
+netflix.com
+nflxvideo.net
+spotify.com
+
+# Resmi Kurumlar
+turkiye.gov.tr

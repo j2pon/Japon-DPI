@@ -87,9 +87,9 @@ typedef struct {
 
 static inline void config_set_defaults(JaponConfig *cfg) {
     ZeroMemory(cfg, sizeof(*cfg));
-    cfg->auto_ttl_delta = 2;
+    cfg->auto_ttl_delta = 3;
     cfg->auto_ttl_min   = 3;
-    cfg->auto_ttl_max   = 10;
+    cfg->auto_ttl_max   = 6;
     cfg->fake_repeats   = 1;
     cfg->dns_port_v4    = 53;
     cfg->dns_port_v6    = 53;

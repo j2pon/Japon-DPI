@@ -73,6 +73,10 @@ uint8_t ttl_compute_auto_fake(uint8_t synack_ttl, uint8_t delta, uint8_t min_ttl
     uint16_t init_ttl;
     if (synack_ttl <= 64) {
         init_ttl = 64;
+    } else if (synack_ttl <= 120 && synack_ttl >= 96) {
+        /* Google/GFE & some CDNs use initial TTL=120 or asymmetric 128 return paths;
+         * treat conservatively as 120 so fake TTL never overshoots outbound hop count. */
+        init_ttl = 120;
     } else if (synack_ttl <= 128) {
         init_ttl = 128;
     } else {

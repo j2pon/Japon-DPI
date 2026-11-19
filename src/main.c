@@ -267,11 +267,12 @@ static int run_self_tests(void) {
           !dpi_is_quic_initial(wireguard, sizeof(wireguard)) &&
           !dpi_is_quic_initial(short_udp, sizeof(short_udp)));
 
-    /* Test 4: Auto-TTL hop estimation */
-    CHECK("Auto-TTL hop hesaplama (Linux TTL=54 -> 10 hop -> fake 8; LAN TTL=63 -> 0)",
-          ttl_compute_auto_fake(54, 2, 3, 10) == 8 &&
-          ttl_compute_auto_fake(116, 2, 3, 10) == 10 &&
-          ttl_compute_auto_fake(63, 2, 3, 10) == 0);
+    /* Test 4: Auto-TTL hop estimation (including Google asymmetric TTL=112 safety) */
+    CHECK("Auto-TTL hop hesaplama (Linux TTL=54 -> 6, Google TTL=112 -> 5, LAN TTL=63 -> 0)",
+          ttl_compute_auto_fake(54, 3, 3, 6) == 6 &&
+          ttl_compute_auto_fake(112, 3, 3, 6) == 5 &&
+          ttl_compute_auto_fake(118, 3, 3, 6) == 0 &&
+          ttl_compute_auto_fake(63, 3, 3, 6) == 0);
 
     /* Test 5: WinDivert filter generation */
     JaponConfig fcfg;
@@ -340,6 +341,31 @@ static int run_self_tests(void) {
     int in_rc = dns_redir_process(&dr, &dcfg, &dstats, false, &ip_pkt, NULL, &udp_pkt, dns_q, sizeof(dns_q));
     bool in_ok = (in_rc == 1 && ip_pkt.SrcAddr == gw_ip.s_addr && udp_pkt.SrcPort == htons(53));
     CHECK("DNS NAT yonlendirme gidis-donus (192.168.1.1:53 <-> 77.88.8.8:1253)", out_ok && in_ok);
+
+    /* Test 8: DNS whitelist IP learning for YouTube QUIC 0-RTT pass-through */
+    DomainList wl;
+    domain_list_init(&wl);
+    domain_list_add(&wl, "googlevideo.com");
+    IpWhitelistCache ip_wl;
+    memset(&ip_wl, 0, sizeof(ip_wl));
+    /* Minimal valid DNS response for rr1.googlevideo.com -> 173.194.188.134 */
+    static const uint8_t sample_dns_resp[] = {
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'r','r','1', 0x0b, 'g','o','o','g','l','e','v','i','d','e','o', 0x03, 'c','o','m', 0x00,
+        0x00, 0x01, 0x00, 0x01,
+        0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04,
+        173, 194, 188, 134
+    };
+    dpi_dns_learn_whitelist_ips(sample_dns_resp, sizeof(sample_dns_resp), &wl, &ip_wl);
+    struct in_addr yt_ip, dc_ip;
+    inet_pton(AF_INET, "173.194.188.134", &yt_ip);
+    inet_pton(AF_INET, "162.159.134.233", &dc_ip);
+    uint32_t yt_key[4] = { yt_ip.s_addr, 0, 0, 0 };
+    uint32_t dc_key[4] = { dc_ip.s_addr, 0, 0, 0 };
+    CHECK("YouTube/Whitelist DNS IP ogrenme (QUIC 0-RTT gecisi)",
+          dpi_ip_wl_contains(&ip_wl, false, yt_key) &&
+          !dpi_ip_wl_contains(&ip_wl, false, dc_key));
+    domain_list_free(&wl);
 
 #undef CHECK
     printf("[SELF-TEST] Tamamlandi: %d basarili, %d basarisiz.\n", passed, failed);

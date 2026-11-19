@@ -8,18 +8,33 @@
 #include "dns_redir.h"
 #include "domain_list.h"
 
+#define IP_WL_CACHE_SIZE 1024 /* power of 2 */
+#define IP_WL_CACHE_MASK (IP_WL_CACHE_SIZE - 1)
+
 typedef struct {
-    JaponConfig   cfg;
-    JaponStats    stats;
-    FakePayloads  fakes;
-    TtlCache      ttl_cache;
-    DnsRedirector dns_redir;
-    DomainList    blacklist;
-    DomainList    whitelist;
-    bool          has_blacklist;
-    bool          has_whitelist;
-    HANDLE        wd_handle;
-    volatile LONG stop_flag;
+    uint8_t  valid;
+    uint8_t  is_v6;
+    uint32_t ip[4];
+    uint64_t timestamp_ms;
+} IpWhitelistEntry;
+
+typedef struct {
+    IpWhitelistEntry entries[IP_WL_CACHE_SIZE];
+} IpWhitelistCache;
+
+typedef struct {
+    JaponConfig      cfg;
+    JaponStats       stats;
+    FakePayloads     fakes;
+    TtlCache         ttl_cache;
+    DnsRedirector    dns_redir;
+    DomainList       blacklist;
+    DomainList       whitelist;
+    IpWhitelistCache ip_wl;
+    bool             has_blacklist;
+    bool             has_whitelist;
+    HANDLE           wd_handle;
+    volatile LONG    stop_flag;
 } DpiEngine;
 
 typedef struct {
@@ -45,5 +60,8 @@ bool dpi_parse_tls_client_hello(const uint8_t *payload, size_t len, TlsParseResu
 bool dpi_extract_http_host(const uint8_t *payload, size_t len, char *host_out, size_t host_cap);
 bool dpi_mangle_http_payload(uint8_t *payload, size_t len, const JaponConfig *cfg);
 bool dpi_is_quic_initial(const uint8_t *payload, size_t len);
+void dpi_dns_learn_whitelist_ips(const uint8_t *dns_payload, size_t len,
+                                 const DomainList *whitelist, IpWhitelistCache *ip_wl);
+bool dpi_ip_wl_contains(const IpWhitelistCache *ip_wl, bool is_v6, const uint32_t ip[4]);
 
 #endif /* JAPONDPI_DPI_ENGINE_H */
